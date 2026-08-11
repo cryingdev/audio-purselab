@@ -7,7 +7,7 @@ npm install
 npm run dev      # http://localhost:3000
 ```
 
-규격과 절차의 근거는 [`../Tools/Audio/suno-music-prompts.md`](../Tools/Audio/suno-music-prompts.md)와 [`../Tools/Audio/veo-sfx-prompts.md`](../Tools/Audio/veo-sfx-prompts.md)에 있다.
+**규격의 진실 공급원은 이 저장소가 아니라 Malworld다.** 샘플레이트·채널·피크·루프 규칙은 Malworld 저장소의 `Tools/Audio/suno-music-prompts.md`(음악)와 `Tools/Audio/veo-sfx-prompts.md`(효과음·환경음)에 있고, 이 도구는 그 규칙을 실행하는 손이다. **둘이 어긋나면 Malworld 쪽이 맞다.**
 
 ## ffmpeg을 쓰지 않는다 — 브라우저가 이미 한다
 
@@ -52,4 +52,6 @@ npm run dev      # http://localhost:3000
 
 ## 저장소 위치
 
-이 폴더는 **자체 `.git`을 가진 중첩 저장소**다. Malworld에서 `git add .` 하면 embedded repository 경고와 함께 gitlink로 박혀 내용이 따라가지 않는다. 셋 중 하나로 정해야 한다 — ① Malworld `.gitignore`에 넣기, ② 중첩 `.git`을 지우고 Malworld에 흡수, ③ 서브모듈로 정식 등록. `Tools/Blender/`가 저장소 안에 있는 것을 보면 ②가 이 프로젝트 방식이다. **아직 정해지지 않았다.**
+**독립 저장소다** (2026-08-11 결정). 원래 Malworld 안에 중첩돼 있었는데, 그대로 두면 `git add .`가 gitlink로 박아 내용이 따라가지 않아서 **Malworld 밖으로 옮겼다.**
+
+그래서 Malworld 문서와는 **상대 링크로 잇지 않는다** — 두 저장소의 상대 위치가 정해져 있지 않기 때문이다. 서로를 가리킬 때는 저장소 이름과 파일 경로를 글로 적는다.
