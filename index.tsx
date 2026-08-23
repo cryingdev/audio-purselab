@@ -528,9 +528,32 @@ const App: React.FC = () => {
    * 처음부터 다시. `트랙 추가` 가 더하기만 하게 된 뒤로 **여기가 유일한 되돌아갈
    * 자리**라, 편집뿐 아니라 쌓아 둔 트랙까지 함께 비운다.
    */
+  /*
+   * 두 번 눌러야 지워진다. 전에는 `confirm()` 을 띄웠는데, **대화상자가 막히는
+   * 자리(웹뷰·데스크톱 앱 안)에서는 `confirm` 이 곧바로 false 를 돌려주므로
+   * 버튼을 눌러도 아무 일도 안 일어난 것처럼 보였다.** 확인을 버튼 안으로
+   * 들여오면 어디서든 똑같이 동작하고, 초점을 빼앗지도 않는다.
+   */
+  const [resetArmed, setResetArmed] = useState(false);
+  const resetTimer = useRef<number | null>(null);
+  const nothingToReset = comp.clips.length === 0 && !audio.currentUrl;
+
+  const handleResetClick = () => {
+    if (nothingToReset) return;
+    if (!resetArmed) {
+      setResetArmed(true);
+      if (resetTimer.current !== null) clearTimeout(resetTimer.current);
+      // 물어본 채로 오래 두지 않는다 — 다음에 눌렀을 때 지워지면 놀란다.
+      resetTimer.current = window.setTimeout(() => setResetArmed(false), 4000);
+      return;
+    }
+    if (resetTimer.current !== null) clearTimeout(resetTimer.current);
+    setResetArmed(false);
+    handleRevert();
+  };
+
   const handleRevert = () => {
-    if (comp.clips.length === 0 && !audio.currentUrl) return;
-    if (!confirm('쌓아 둔 트랙과 편집을 모두 버리고 빈 상태로 돌아갑니다. 되돌리기 기록도 지워집니다. 계속할까요?')) return;
+    if (nothingToReset) return;
 
     /*
      * 예전에는 "합친 결과를 처음 것으로 되돌리기"였는데, 그러면 클립은 0 인데
@@ -563,6 +586,8 @@ const App: React.FC = () => {
     setExportName('');
     setZoomFactor(1);
     setActiveRegion(null);
+    setGainDbRaw(0);
+    setGainNotice(null);
     regionsRef.current?.clearRegions();
   };
 
@@ -1498,12 +1523,25 @@ const App: React.FC = () => {
                   <Redo2 className="w-5 h-5" />
                 </button>
               </div>
-              <button 
-                onClick={handleRevert}
-                className="flex items-center gap-2 bg-slate-800 hover:bg-rose-900/30 text-slate-400 hover:text-rose-400 px-4 py-2.5 rounded-xl transition-all border border-slate-700 hover:border-rose-700/50 text-xs font-bold uppercase tracking-wider"
+              <button
+                onClick={handleResetClick}
+                onBlur={() => setResetArmed(false)}
+                disabled={nothingToReset}
+                className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all border text-xs font-bold uppercase tracking-wider disabled:opacity-30 ${
+                  resetArmed
+                    ? 'bg-rose-600 text-white border-rose-400 shadow-lg shadow-rose-600/25'
+                    : 'bg-slate-800 hover:bg-rose-900/30 text-slate-400 hover:text-rose-400 border-slate-700 hover:border-rose-700/50'
+                }`}
+                title={
+                  nothingToReset
+                    ? '지울 것이 없습니다'
+                    : resetArmed
+                      ? '한 번 더 누르면 트랙과 되돌리기 기록이 모두 지워집니다'
+                      : '트랙과 편집을 모두 버리고 빈 상태로 돌아갑니다 — 두 번 눌러야 지워집니다'
+                }
               >
                 <RotateCcw className="w-4 h-4" />
-                초기화
+                {resetArmed ? '한 번 더 누르면 지웁니다' : '초기화'}
               </button>
               <button 
                 onClick={handleDownloadAction}
