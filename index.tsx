@@ -18,6 +18,7 @@ import {
   Download,
   X,
   Wind,
+  Ruler,
   AlertTriangle,
   Info,
   SkipBack,
@@ -53,6 +54,8 @@ import {
   applyCrop,
   mixBufferToMono,
   applyGainCapped,
+  applySpeedChange,
+  timeStretch,
   makeContext,
   decodeFileToBuffer,
   suggestAssetName,
@@ -157,6 +160,13 @@ const GAIN_MIN_DB = -100; // 0% — 16-bit 로 쓰면 어차피 0 이다
 
 /** 넘침 천장. 선형 1.0 = 0 dBFS — 이 위는 16-bit 로 쓸 때 잘려 나간다. */
 const CLIP_CEILING = 1;
+
+/*
+ * 길이를 바꿀 수 있는 폭. 4배 밖은 어느 방식으로도 소리가 남아나지 않는다 —
+ * 속도 바꾸기는 음정이 두 옥타브 튀고, 타임 스트레치는 물결친다.
+ */
+const LEN_RATIO_MIN = 0.25;
+const LEN_RATIO_MAX = 4;
 
 const App: React.FC = () => {
   const [audio, setAudio] = useState<AudioState>({
@@ -1339,6 +1349,45 @@ const App: React.FC = () => {
     );
   };
 
+  /* ---- 길이 바꾸기 ---- */
+
+  /** 목표 길이(초). 클립을 바꾸면 그 클립의 길이로 다시 맞춘다. */
+  const [targetLenSec, setTargetLenSec] = useState(0);
+  const [keepPitch, setKeepPitch] = useState(true);
+  const editClipDur = editTargetClip?.buffer.duration ?? null;
+  useEffect(() => {
+    if (editClipDur !== null) setTargetLenSec(Math.round(editClipDur * 1000) / 1000);
+  }, [editClipDur, editTargetClip?.id]);
+
+  const lenRatio = editClipDur && editClipDur > 0 && targetLenSec > 0 ? targetLenSec / editClipDur : null;
+  const lenBars = targetLenSec > 0 ? targetLenSec / barSeconds(loop.bpm, loop.beatsPerBar) : null;
+  const lenRatioOk = lenRatio !== null && lenRatio >= LEN_RATIO_MIN && lenRatio <= LEN_RATIO_MAX;
+
+  /** 목표 길이를 **마디 수**에 붙인다 — 루프는 마디에 맞아야 돌 때 박자가 안 어긋난다. */
+  const snapLenToBar = () => {
+    const bar = barSeconds(loop.bpm, loop.beatsPerBar);
+    const bars = Math.max(1, Math.round(targetLenSec / bar));
+    setTargetLenSec(Math.round(bars * bar * 1000) / 1000);
+  };
+
+  const handleLengthAction = () => {
+    if (lenRatio === null) { showNotice('먼저 트랙에서 클립을 고르십시오.'); return; }
+    if (Math.abs(lenRatio - 1) < 1e-4) { showNotice('길이가 이미 같습니다.'); return; }
+    if (!lenRatioOk) {
+      showNotice(`길이는 ${LEN_RATIO_MIN}~${LEN_RATIO_MAX}배 안에서만 바꿉니다 — 지금은 ×${lenRatio.toFixed(2)} 입니다.`, 'error');
+      return;
+    }
+    /*
+     * 둘은 다른 물건이다. `음정 유지` 를 끄면 테이프를 빨리 돌리는 것과 같아
+     * 음정이 함께 바뀌고(정확·빠름), 켜면 조각을 겹쳐 붙여 음정을 지킨다
+     * (환경음은 잘 되고, 짧은 타격음은 ±10% 를 넘으면 두 번 친 것처럼 들린다).
+     */
+    performProcessing(
+      `${keepPitch ? '길이만' : '속도'} ${targetLenSec.toFixed(3)}초로…`,
+      (buffer, ctx) => (keepPitch ? timeStretch(buffer, lenRatio, ctx) : applySpeedChange(buffer, lenRatio, ctx))
+    );
+  };
+
   const handleNormalizeToTargetAction = () => {
     performProcessing(`피크를 ${loop.targetDbfs} dBFS 로…`, (buffer) =>
       applyNormalizeToDbfs(buffer, loop.targetDbfs)
@@ -2017,6 +2066,63 @@ const App: React.FC = () => {
                     이 묶음은 "굽기"다. 내보내기도 같은 설정을 거치므로 여기 값이
                     곧 내보낼 파일의 값이다 — 그래서 이름에 그렇게 적어 뒀다.
                   */}
+
+                  {/*
+                    길이 바꾸기. 자르지 않고 길이를 맞추는 유일한 길이다 —
+                    잘라서 맞추면 잔향이 끊긴다. 마디 스냅이 붙어 있는 이유가 그것이다:
+                    7.70초짜리를 8.00초(120 BPM 4마디)로 늘려 격자에 맞추면
+                    내용을 하나도 안 버리고 루프가 박자에 맞는다.
+                  */}
+                  {group('길이 바꾸기', 'text-emerald-500/70', <>
+                    {numField('목표 길이', targetLenSec, v => setTargetLenSec(Math.max(0, v)), { step: 0.1, suffix: 's', width: 'w-24' })}
+                    <button
+                      onClick={snapLenToBar}
+                      disabled={!editTargetClip}
+                      className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-slate-300 rounded-xl border border-slate-700 text-[10px] font-black uppercase tracking-widest transition-all"
+                      title={`목표 길이를 마디 수에 딱 붙인다 (${loop.bpm} BPM · 한 마디 ${barSeconds(loop.bpm, loop.beatsPerBar).toFixed(4)}초)`}
+                    >
+                      <Grid3x3 className="w-3.5 h-3.5" /> 마디 스냅
+                    </button>
+                    <label
+                      className="flex items-center gap-2 px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl cursor-pointer"
+                      title="켜면 음정을 지키며 길이만 바꾼다(조각을 겹쳐 붙인다). 끄면 테이프를 빨리 돌리듯 음정도 함께 바뀐다 — 정확하고 빠르다."
+                    >
+                      <input
+                        type="checkbox"
+                        checked={keepPitch}
+                        onChange={(e) => setKeepPitch(e.target.checked)}
+                        className="accent-emerald-500"
+                      />
+                      <span className="text-[10px] font-black text-emerald-400 tracking-widest whitespace-nowrap">
+                        음정 유지
+                      </span>
+                    </label>
+                    <button
+                      onClick={handleLengthAction}
+                      disabled={!editTargetClip || audio.isProcessing || !lenRatioOk || (lenRatio !== null && Math.abs(lenRatio - 1) < 1e-4)}
+                      className="flex items-center gap-1.5 px-4 py-2 bg-emerald-600/90 hover:bg-emerald-500 disabled:opacity-30 text-white rounded-xl border border-emerald-400/50 text-[10px] font-black uppercase tracking-widest transition-all"
+                      title={
+                        !editTargetClip
+                          ? '먼저 트랙에서 클립을 고르십시오'
+                          : keepPitch
+                            ? '음정은 그대로 두고 길이만 바꾼다'
+                            : '속도를 바꿔 길이를 맞춘다 — 음정도 함께 바뀐다'
+                      }
+                    >
+                      <Ruler className="w-3.5 h-3.5" /> 길이 바꾸기
+                    </button>
+                    {/* 무슨 일이 일어날지 누르기 전에 보여 준다 — 배율과 마디 수가 판단의 전부다. */}
+                    {editClipDur !== null && lenRatio !== null && (
+                      <span className={`text-[10px] font-mono tabular-nums whitespace-nowrap self-center ${
+                        !lenRatioOk ? 'text-rose-400' : Math.abs(lenRatio - 1) < 1e-4 ? 'text-slate-500' : 'text-emerald-300'
+                      }`}>
+                        {editClipDur.toFixed(3)}s → {targetLenSec.toFixed(3)}s
+                        {' · '}×{lenRatio.toFixed(3)}
+                        {lenBars !== null && ` · ${lenBars.toFixed(2)}마디`}
+                        {!lenRatioOk && ` · ${LEN_RATIO_MIN}~${LEN_RATIO_MAX}배 밖`}
+                      </span>
+                    )}
+                  </>)}
 
                   {/*
                     게이트는 폭을 다 차지하는 알약 버튼으로 패널 **밖에** 떠 있었다.

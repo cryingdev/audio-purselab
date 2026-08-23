@@ -320,6 +320,158 @@ export function applyGain(buffer: AudioBuffer, multiplier: number, start?: numbe
  * 구간만 뒤집을 때는 그 바깥이 손대지지 않으므로 경계에서 파형이 튈 수 있는데,
  * 그건 페이드로 다듬을 몫이다.
  */
+/**
+ * 속도를 바꿔 길이를 맞춘다 — **음정도 같이 바뀐다.**
+ *
+ * `ratio` 는 "새 길이 ÷ 옛 길이"다. 0.5 면 절반 길이가 되고 두 배 빨라지며
+ * 음정이 한 옥타브 올라간다. 테이프를 빨리 돌리는 것과 같다.
+ *
+ * 선형 보간으로 다시 뽑는다. 빨리 돌릴 때(ratio < 1) 원본의 높은 쪽이
+ * 나이키스트를 넘어 되접히는데(에일리어싱), 선형 보간이 약한 저역통과 노릇을
+ * 해서 실제로는 거의 안 들린다. 음정을 지키고 싶으면 `timeStretch` 를 쓴다.
+ */
+export function applySpeedChange(buffer: AudioBuffer, ratio: number, audioCtx: AudioContext): AudioBuffer {
+  const outLen = Math.max(1, Math.round(buffer.length * ratio));
+  const out = audioCtx.createBuffer(buffer.numberOfChannels, outLen, buffer.sampleRate);
+  for (let c = 0; c < buffer.numberOfChannels; c++) {
+    const src = buffer.getChannelData(c);
+    const dst = out.getChannelData(c);
+    const last = src.length - 1;
+    for (let i = 0; i < outLen; i++) {
+      const at = i / ratio;
+      const i0 = Math.floor(at);
+      if (i0 >= last) { dst[i] = src[last] ?? 0; continue; }
+      const frac = at - i0;
+      dst[i] = src[i0] + (src[i0 + 1] - src[i0]) * frac;
+    }
+  }
+  return out;
+}
+
+/** 50% 겹침에서 합이 1 이 되는 창. 겹쳐 더한 뒤 창 합으로 나누므로 가장자리도 안 파인다. */
+function hannWindow(n: number): Float32Array {
+  const w = new Float32Array(n);
+  for (let i = 0; i < n; i++) w[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / n);
+  return w;
+}
+
+/**
+ * 음정은 그대로 두고 길이만 바꾼다 (WSOLA).
+ *
+ * `ratio` 는 "새 길이 ÷ 옛 길이"다. 1.04 면 4% 늘어난다.
+ *
+ * 왜 겹쳐 붙이는가: 그냥 잘라 이으면 이음매에서 파형의 위상이 어긋나 딸깍거린다.
+ * WSOLA 는 **다음 조각을 가져올 자리를 ±10 ms 안에서 옮겨 가며 찾아**, 앞 조각이
+ * 자연스럽게 이어질 파형과 가장 닮은 자리를 고른다. 그래서 위상이 맞물린다.
+ *
+ * **스테레오는 두 채널을 같은 자리에서 가져온다.** 채널마다 따로 찾으면 좌우가
+ * 다른 지점을 쓰게 되어 음상이 찢어진다 — 닮은 정도는 두 채널을 더한 것에서 잰다.
+ *
+ * 품질은 자료를 탄다. 환경음·바람·웅성거림은 잘 늘어나고, 말굽 같은 짧은 타격음은
+ * ±10% 를 넘으면 두 번 친 것처럼 들리며, 음악은 ±8% 안쪽이 한계다.
+ */
+export function timeStretch(buffer: AudioBuffer, ratio: number, audioCtx: AudioContext): AudioBuffer {
+  const chans = buffer.numberOfChannels;
+  const inLen = buffer.length;
+  const outLen = Math.max(1, Math.round(inLen * ratio));
+
+  // 길이가 그대로면 손대지 않는다 — 괜히 겹쳐 붙이면 소리만 흐려진다.
+  if (Math.abs(ratio - 1) < 1e-6 || inLen === 0) {
+    const same = audioCtx.createBuffer(chans, inLen, buffer.sampleRate);
+    for (let c = 0; c < chans; c++) same.getChannelData(c).set(buffer.getChannelData(c));
+    return same;
+  }
+
+  const FRAME = 2048;             // 48 kHz 에서 약 43 ms
+  const HOP_OUT = FRAME >> 1;     // 50% 겹침
+  const OVERLAP = FRAME - HOP_OUT;
+  const SEARCH = 480;             // ±10 ms. 100 Hz 주기까지 덮는다
+  const COARSE = 8;               // 성기게 훑고 그 근처만 촘촘히 — 전수 탐색은 너무 느리다
+
+  const out = audioCtx.createBuffer(chans, outLen, buffer.sampleRate);
+  const src: Float32Array[] = [];
+  const dst: Float32Array[] = [];
+  for (let c = 0; c < chans; c++) { src.push(buffer.getChannelData(c)); dst.push(out.getChannelData(c)); }
+
+  const win = hannWindow(FRAME);
+  const winSum = new Float32Array(outLen);
+
+  /** 두 자리의 닮은 정도. 채널을 더해서 재므로 스테레오가 한 몸으로 움직인다. */
+  const similarity = (a: number, b: number): number => {
+    let dot = 0, energy = 0;
+    for (let i = 0; i < OVERLAP; i += 2) {   // 두 표본에 하나씩만 봐도 최댓값 자리는 안 바뀐다
+      let va = 0, vb = 0;
+      for (let c = 0; c < chans; c++) { va += src[c][a + i] ?? 0; vb += src[c][b + i] ?? 0; }
+      dot += va * vb;
+      energy += vb * vb;
+    }
+    // 에너지로 나눠야 큰 소리가 난 자리로만 쏠리지 않는다.
+    return dot / Math.sqrt(energy + 1e-9);
+  };
+
+  const hopIn = HOP_OUT / ratio;
+  /*
+   * `nominal` 은 **탐색 결과를 되먹이지 않는** 기준 위치다. 찾아낸 자리를 다음
+   * 기준으로 삼았더니 어긋남이 쌓여 입력이 먼저 바닥났고, 2초를 1.25배로 늘렸을 때
+   * **뒤 10.6%가 무음**이 됐다 (음정을 재면 440 Hz 가 393 Hz 로 읽혔다).
+   * 기준을 따로 두면 inPos/outPos 비가 정확히 1/ratio 로 유지되어 끝에서 딱 맞는다.
+   */
+  let nominal = 0;
+  let inPos = 0;
+  let outPos = 0;
+
+  while (outPos < outLen) {
+    const take = Math.min(FRAME, outLen - outPos, inLen - inPos);
+    if (take <= 0) break;
+    for (let c = 0; c < chans; c++) {
+      const s = src[c], d = dst[c];
+      for (let i = 0; i < take; i++) d[outPos + i] += s[inPos + i] * win[i];
+    }
+    for (let i = 0; i < take; i++) winSum[outPos + i] += win[i];
+
+    /*
+     * 다음 조각을 어디서 가져올까. 이 조각 뒤에 **자연스럽게 이어질** 파형은
+     * `inPos + HOP_OUT` 부터다. 그것과 가장 닮은 자리를 기준 위치 근처에서 찾는다.
+     */
+    nominal += hopIn;
+    const ideal = Math.round(nominal);
+    const template = inPos + HOP_OUT;
+    const lo = Math.max(0, ideal - SEARCH);
+    const hi = Math.min(inLen - OVERLAP - 1, ideal + SEARCH);
+
+    // 끝머리라 찾을 자리가 없으면 **멈추지 않고** 기준 자리를 그냥 쓴다.
+    // 멈추면 남은 출력이 무음으로 남는다.
+    let best = Math.min(ideal, Math.max(0, inLen - 1));
+    if (hi > lo && template + OVERLAP < inLen) {
+      let bestScore = -Infinity;
+      for (let q = lo; q <= hi; q += COARSE) {
+        const sc = similarity(template, q);
+        if (sc > bestScore) { bestScore = sc; best = q; }
+      }
+      for (let q = Math.max(lo, best - COARSE); q <= Math.min(hi, best + COARSE); q++) {
+        const sc = similarity(template, q);
+        if (sc > bestScore) { bestScore = sc; best = q; }
+      }
+    }
+
+    inPos = best;
+    outPos += HOP_OUT;
+  }
+
+  /*
+   * 창 합으로 나눈다. 한 조각만 덮은 가장자리에서도 원래 크기가 그대로 살아난다
+   * (같은 창으로 곱했다가 그 창으로 나누므로). 안 나누면 앞뒤가 페이드처럼 파인다.
+   */
+  for (let c = 0; c < chans; c++) {
+    const d = dst[c];
+    for (let i = 0; i < outLen; i++) {
+      const w = winSum[i];
+      if (w > 1e-3) d[i] /= w;
+    }
+  }
+  return out;
+}
+
 export function applyReverse(buffer: AudioBuffer, start?: number, end?: number): AudioBuffer {
   const sampleRate = buffer.sampleRate;
   const rawFrom = start !== undefined ? Math.floor(start * sampleRate) : 0;

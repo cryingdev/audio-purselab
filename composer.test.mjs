@@ -3,7 +3,7 @@ import {
   appendStartSec, wrapLoopEnds, clipEndSec, placeOnNewLanes,
   splitClipAt, rippleInsert, rippleDelete, moveTrack, removeTrack, placeClips
 } from './node_modules/.pulselab/composer.mjs';
-import { suggestAssetName, applyReverse, applyGainCapped, peakOfRange } from './node_modules/.pulselab/audioUtils.mjs';
+import { suggestAssetName, applyReverse, applyGainCapped, peakOfRange, applySpeedChange, timeStretch, barSeconds } from './node_modules/.pulselab/audioUtils.mjs';
 
 const SR = 48000;
 
@@ -431,6 +431,111 @@ console.log('\n[8] 넘침 막기 — 자르지 말고 배수를 깎는다');
     check('200% 는 +6.02 dB', MAX_DB === 6.02, `${MAX_DB}`);
     const back = Math.round(Math.pow(10, MAX_DB / 20) * 100);
     check('6.02 dB 는 다시 200%', back === 200, `${back}%`);
+  }
+}
+
+
+console.log('\n[9] 길이 바꾸기 — 속도 바꾸기와 타임 스트레치');
+{
+  /** 주파수를 재 본다 — 영교차 횟수로 대략의 음정을 잡는다. */
+  const zeroCrossHz = (b, ch = 0) => {
+    const d = b.getChannelData(ch);
+    let n = 0;
+    for (let i = 1; i < d.length; i++) if ((d[i - 1] < 0) !== (d[i] < 0)) n++;
+    return (n / 2) / (d.length / b.sampleRate);
+  };
+  const rms = (b, ch = 0) => {
+    const d = b.getChannelData(ch);
+    let s = 0;
+    for (let i = 0; i < d.length; i++) s += d[i] * d[i];
+    return Math.sqrt(s / d.length);
+  };
+
+  // --- 속도 바꾸기: 길이가 준 만큼 음정이 올라간다 ---
+  {
+    const src = tone(440, 2);
+    const half = applySpeedChange(src, 0.5, ctx);
+    check('속도: 길이가 절반', half.length === Math.round(src.length * 0.5), `${half.length}`);
+    const hz = zeroCrossHz(half);
+    check('속도: 음정이 두 배 (440 → 880)', Math.abs(hz - 880) < 15, `${hz.toFixed(1)} Hz`);
+  }
+  {
+    const src = tone(440, 2);
+    const slow = applySpeedChange(src, 2, ctx);
+    check('속도: 두 배 길이', slow.length === src.length * 2, `${slow.length}`);
+    const hz = zeroCrossHz(slow);
+    check('속도: 음정이 절반 (440 → 220)', Math.abs(hz - 220) < 10, `${hz.toFixed(1)} Hz`);
+  }
+  {
+    const st = new FakeBuffer(2, SR, SR);
+    st.getChannelData(0).fill(0.5);
+    st.getChannelData(1).fill(-0.5);
+    const out = applySpeedChange(st, 0.5, ctx);
+    check('속도: 채널 수가 유지된다', out.numberOfChannels === 2);
+    check('속도: 채널이 안 섞인다', out.getChannelData(0)[10] > 0.4 && out.getChannelData(1)[10] < -0.4);
+  }
+
+  // --- 타임 스트레치: 길이만 바뀌고 음정은 그대로 ---
+  {
+    const src = tone(440, 2);
+    for (const r of [1.25, 0.8]) {
+      const out = timeStretch(src, r, ctx);
+      const want = Math.round(src.length * r);
+      check(`스트레치 ×${r}: 길이가 맞는다`, Math.abs(out.length - want) < 2, `${out.length} (기대 ${want})`);
+      const hz = zeroCrossHz(out);
+      check(`스트레치 ×${r}: 음정이 그대로 (440)`, Math.abs(hz - 440) < 12, `${hz.toFixed(1)} Hz`);
+      const dropDb = 20 * Math.log10(rms(out) / rms(src));
+      check(`스트레치 ×${r}: 음량이 안 파인다`, Math.abs(dropDb) < 1.5, `${dropDb.toFixed(2)} dB`);
+    }
+  }
+  {
+    // 가장자리가 페이드처럼 파이면 안 된다 — 창 합으로 나눠서 막았다.
+    const src = dc(0.5, 1);
+    const out = timeStretch(src, 1.2, ctx);
+    const d = out.getChannelData(0);
+    const mid = d[Math.floor(d.length / 2)];
+    check('스트레치: 한가운데가 원래 크기', Math.abs(mid - 0.5) < 0.02, `${mid.toFixed(4)}`);
+    check('스트레치: 시작 100표본 뒤도 원래 크기', Math.abs(d[100] - 0.5) < 0.05, `${d[100].toFixed(4)}`);
+    check('스트레치: 끝 100표본 앞도 원래 크기', Math.abs(d[d.length - 100] - 0.5) < 0.05, `${d[d.length-100].toFixed(4)}`);
+  }
+  {
+    const src = tone(440, 1, 2);
+    const out = timeStretch(src, 1.3, ctx);
+    check('스트레치: 스테레오 채널 수 유지', out.numberOfChannels === 2);
+    // 두 채널이 같은 자리에서 잘려야 음상이 안 찢어진다 — 같은 입력이면 출력도 같아야 한다.
+    let maxDiff = 0;
+    for (let i = 0; i < out.length; i++) maxDiff = Math.max(maxDiff, Math.abs(out.getChannelData(0)[i] - out.getChannelData(1)[i]));
+    check('스트레치: 두 채널이 같은 자리에서 이어진다', maxDiff < 1e-6, `최대 차 ${maxDiff.toExponential(1)}`);
+  }
+  {
+    /*
+     * 끝이 무음으로 남으면 안 된다. 탐색 결과를 다음 기준으로 되먹였더니
+     * 어긋남이 쌓여 입력이 먼저 바닥났고, 뒤 10.6%가 무음이 됐던 자리다.
+     */
+    for (const r of [1.25, 1.6, 0.7]) {
+      const out = timeStretch(tone(440, 2), r, ctx);
+      const d = out.getChannelData(0);
+      let last = 0;
+      for (let i = 0; i < d.length; i++) if (Math.abs(d[i]) > 1e-4) last = i;
+      const filled = last / d.length;
+      check(`스트레치 ×${r}: 끝까지 채운다`, filled > 0.995, `${(filled * 100).toFixed(1)}% 까지 소리가 있다`);
+    }
+  }
+  {
+    const src = tone(440, 1);
+    const same = timeStretch(src, 1, ctx);
+    check('스트레치 ×1 은 그대로 통과', same.length === src.length && Math.abs(same.getChannelData(0)[500] - src.getChannelData(0)[500]) < 1e-9);
+  }
+
+  // --- 마디 스냅 ---
+  {
+    const bar = barSeconds(120, 4);
+    check('120 BPM 4/4 한 마디는 2초', Math.abs(bar - 2) < 1e-9, `${bar}`);
+    const snap = (sec) => Math.max(1, Math.round(sec / bar)) * bar;
+    check('7.70초는 4마디(8초)로 붙는다', Math.abs(snap(7.7) - 8) < 1e-9, `${snap(7.7)}`);
+    check('8.90초는 4마디(8초)로 붙는다', Math.abs(snap(8.9) - 8) < 1e-9, `${snap(8.9)}`);
+    check('9.10초는 5마디(10초)로 붙는다', Math.abs(snap(9.1) - 10) < 1e-9, `${snap(9.1)}`);
+    check('아주 짧아도 한 마디 밑으로는 안 간다', Math.abs(snap(0.2) - bar) < 1e-9, `${snap(0.2)}`);
   }
 }
 
