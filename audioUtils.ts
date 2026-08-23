@@ -591,6 +591,49 @@ export function applySilenceChannel(buffer: AudioBuffer, channelIndex: number): 
   return buffer;
 }
 
+/**
+ * 좌우가 얼마나 다른가. `RMS(L−R) ÷ RMS(L+R)` 다.
+ *
+ * 0 이면 두 채널이 완전히 같다 — **모노를 스테레오 그릇에 담아 온 것**이고,
+ * 모노로 내려도 잃는 것이 하나도 없다. 진짜 스테레오는 0.1~1 쯤 나온다.
+ * 실측: Veo 가 준 낟알 붓는 소리(2ch)가 **0.0007** 이었다.
+ */
+export function channelDifference(buffer: AudioBuffer): number {
+  if (buffer.numberOfChannels < 2) return 0;
+  const L = buffer.getChannelData(0), R = buffer.getChannelData(1);
+  let diff = 0, sum = 0;
+  for (let i = 0; i < buffer.length; i++) {
+    const d = L[i] - R[i], m = L[i] + R[i];
+    diff += d * d; sum += m * m;
+  }
+  if (sum === 0) return 0;
+  return Math.sqrt(diff / sum);
+}
+
+/**
+ * 이 아래면 "좌우가 사실상 같다"고 본다. -40 dB 다.
+ * 진짜 스테레오는 이 값의 백 배쯤 나오므로 잘못 내릴 걱정이 없다.
+ */
+export const MONO_IDENTICAL_THRESHOLD = 0.01;
+
+/**
+ * 채널을 평균해 1채널로 내린다. Web Audio 의 기본 다운믹스와 같은 규칙이다.
+ *
+ * `mixBufferToMono` 와 결과는 같지만 이쪽은 **순수 함수**라 테스트로 지킬 수 있고
+ * `OfflineAudioContext` 를 안 띄운다 — 담을 때마다 파일 수만큼 띄울 이유가 없다.
+ */
+export function downmixToMono(buffer: AudioBuffer, audioCtx: AudioContext): AudioBuffer {
+  if (buffer.numberOfChannels === 1) return buffer;
+  const out = audioCtx.createBuffer(1, buffer.length, buffer.sampleRate);
+  const d = out.getChannelData(0);
+  const n = buffer.numberOfChannels;
+  for (let c = 0; c < n; c++) {
+    const s = buffer.getChannelData(c);
+    for (let i = 0; i < buffer.length; i++) d[i] += s[i] / n;
+  }
+  return out;
+}
+
 export async function mixBufferToMono(buffer: AudioBuffer, audioCtx: AudioContext): Promise<AudioBuffer> {
   const offlineCtx = new OfflineAudioContext(1, buffer.length, buffer.sampleRate);
   const source = offlineCtx.createBufferSource();

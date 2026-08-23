@@ -53,6 +53,9 @@ import {
   applyCut,
   applyCrop,
   mixBufferToMono,
+  channelDifference,
+  downmixToMono,
+  MONO_IDENTICAL_THRESHOLD,
   applyGainCapped,
   applySpeedChange,
   timeStretch,
@@ -908,6 +911,9 @@ const App: React.FC = () => {
         // Veo mp4 도 그대로 놓으면 된다 — 브라우저가 오디오 트랙만 디코드한다.
         decoded.push({ id: newClipId(), name: file.name, buffer: await decodeFileToBuffer(file, PROJECT_SAMPLE_RATE) });
       }
+      const groomCtx = makeContext();
+      const groomed = groomImported(decoded, groomCtx);
+      void groomCtx.close();
 
       /*
        * 담긴 클립이 없을 때 편집 중인 트랙을 자동으로 클립 0 으로 넣던 것을 뺐다.
@@ -923,6 +929,8 @@ const App: React.FC = () => {
       setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
       // 아무것도 없던 상태에서 클립으로 시작했으면 첫 클립 이름을 제안으로 쓴다.
       if (!audio.currentUrl && decoded[0]) setExportName(suggestAssetName(decoded[0].name));
+      // 말없이 고치지 않는다 — 무엇이 바뀌었는지 적어 준다.
+      if (groomed.length) showNotice(`담으면서 ${groomed.join(' · ')}.`);
       if (bake) await bakeComposition(next);
     } catch (e: any) {
       setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
@@ -1043,6 +1051,9 @@ const App: React.FC = () => {
       for (const file of picked) {
         decoded.push({ id: newClipId(), name: file.name, buffer: await decodeFileToBuffer(file, PROJECT_SAMPLE_RATE) });
       }
+      const groomCtx = makeContext();
+      const groomed = groomImported(decoded, groomCtx);
+      void groomCtx.close();
 
       const hadTrack = !!audio.currentUrl;
       // 자동 포함은 뺐다 — 위 `handleComposerImport` 의 주석 참고.
@@ -1062,6 +1073,8 @@ const App: React.FC = () => {
         if (decoded[0]) setExportName(suggestAssetName(decoded[0].name));
         await bakeComposition(next);
       }
+      // 말없이 고치지 않는다 — 무엇이 바뀌었는지 적어 준다.
+      if (groomed.length) showNotice(`담으면서 ${groomed.join(' · ')}.`);
     } catch (e: any) {
       setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
       showNotice(`디코드할 수 없습니다: ${e?.message ?? e} — 브라우저가 못 여는 코덱이면 이 파일만 ffmpeg 으로 wav 를 뽑아 주십시오.`, 'error');
@@ -1362,6 +1375,42 @@ const App: React.FC = () => {
    * (그보다 짧으면 그 주파수가 통째로 사라진다), 위로 갈수록 거칠어진다.
    */
   const [stretchFrameMs, setStretchFrameMs] = useState(TIME_STRETCH_FRAME_MS_DEFAULT);
+
+  /*
+   * 담을 때 자동으로 손질한다. Veo 가 주는 것이 늘 같은 모양으로 어긋나 있어서,
+   * 담을 때마다 손으로 두 번 누르게 되기 때문이다. 실측한 낟알 붓는 소리는
+   * 피크 **-25.12 dBFS**(규격까지 +22 dB)에 2채널이지만 좌우 차이가 **0.0007** 이었다.
+   *
+   * **모노는 좌우가 사실상 같을 때만 내린다.** 규격은 효과음·말 상태음만 모노이고
+   * 음악·환경음은 스테레오여야 한다 — 무턱대고 내리면 규격을 어긴다. 좌우가 같은
+   * 것을 내리는 것은 잃을 것이 없는 일(파형이 그대로다)이라 안전하다.
+   */
+  const [autoMono, setAutoMono] = useState(true);
+  const [autoNormalize, setAutoNormalize] = useState(true);
+
+  const groomImported = useCallback((
+    decoded: { id: string; name: string; buffer: AudioBuffer }[],
+    ctx: AudioContext
+  ): string[] => {
+    const notes: string[] = [];
+    let monoed = 0, gained = 0;
+    for (const clip of decoded) {
+      if (autoMono && clip.buffer.numberOfChannels > 1 && channelDifference(clip.buffer) < MONO_IDENTICAL_THRESHOLD) {
+        clip.buffer = downmixToMono(clip.buffer, ctx);
+        monoed++;
+      }
+      if (autoNormalize) {
+        const before = peakOf(clip.buffer);
+        if (before > 0 && Math.abs(20 * Math.log10(before) - loop.targetDbfs) > 0.05) {
+          clip.buffer = applyNormalizeToDbfs(clip.buffer, loop.targetDbfs);
+          gained++;
+        }
+      }
+    }
+    if (monoed) notes.push(`${monoed}개는 좌우가 같아 모노로 내렸습니다`);
+    if (gained) notes.push(`${gained}개를 ${loop.targetDbfs} dBFS 로 맞췄습니다`);
+    return notes;
+  }, [autoMono, autoNormalize, loop.targetDbfs]);
   const editClipDur = editTargetClip?.buffer.duration ?? null;
   useEffect(() => {
     if (editClipDur !== null) setTargetLenSec(Math.round(editClipDur * 1000) / 1000);
@@ -2075,6 +2124,36 @@ const App: React.FC = () => {
                     이 묶음은 "굽기"다. 내보내기도 같은 설정을 거치므로 여기 값이
                     곧 내보낼 파일의 값이다 — 그래서 이름에 그렇게 적어 뒀다.
                   */}
+
+                  {/*
+                    담을 때 자동으로 하는 일. Veo 가 주는 것이 늘 같은 모양으로
+                    어긋나 있어서(조용하고, 스테레오 그릇에 모노가 담겨 온다)
+                    담을 때마다 손으로 두 번 누르게 된다.
+                  */}
+                  {group('담을 때', 'text-sky-400/70', <>
+                    <label
+                      className="flex items-center gap-2 px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl cursor-pointer"
+                      title={`담자마자 피크를 ${loop.targetDbfs} dBFS 로 맞춘다. Veo 클립은 -20 dBFS 언저리로 오는 일이 흔하다 — 실측한 낟알 붓는 소리는 -25.12 dBFS 였다.`}
+                    >
+                      <input type="checkbox" checked={autoNormalize} onChange={(e) => setAutoNormalize(e.target.checked)} className="accent-sky-500" />
+                      <span className="text-[10px] font-black text-sky-300 tracking-widest whitespace-nowrap">
+                        {loop.targetDbfs} dBFS 로 맞추기
+                      </span>
+                    </label>
+                    <label
+                      className="flex items-center gap-2 px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl cursor-pointer"
+                      title={
+                        '좌우가 사실상 같은 스테레오만 1채널로 내린다 (차이 ' + MONO_IDENTICAL_THRESHOLD + ' 미만).\n' +
+                        '파형이 그대로라 잃는 것이 없고 파일이 절반이 된다.\n' +
+                        '진짜 스테레오는 이 값의 백 배쯤 나오므로 음악·환경음은 안 건드린다 — 규격이 스테레오다.'
+                      }
+                    >
+                      <input type="checkbox" checked={autoMono} onChange={(e) => setAutoMono(e.target.checked)} className="accent-sky-500" />
+                      <span className="text-[10px] font-black text-sky-300 tracking-widest whitespace-nowrap">
+                        좌우 같으면 모노로
+                      </span>
+                    </label>
+                  </>)}
 
                   {/*
                     길이 바꾸기. 자르지 않고 길이를 맞추는 유일한 길이다 —

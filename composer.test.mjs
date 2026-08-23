@@ -3,7 +3,7 @@ import {
   appendStartSec, wrapLoopEnds, clipEndSec, placeOnNewLanes,
   splitClipAt, rippleInsert, rippleDelete, moveTrack, removeTrack, placeClips
 } from './node_modules/.pulselab/composer.mjs';
-import { suggestAssetName, applyReverse, applyGainCapped, peakOfRange, applySpeedChange, timeStretch, barSeconds, TIME_STRETCH_FRAME_MS_DEFAULT } from './node_modules/.pulselab/audioUtils.mjs';
+import { suggestAssetName, applyReverse, applyGainCapped, peakOfRange, applySpeedChange, timeStretch, barSeconds, TIME_STRETCH_FRAME_MS_DEFAULT, channelDifference, downmixToMono, MONO_IDENTICAL_THRESHOLD, applyNormalizeToDbfs, peakOf } from './node_modules/.pulselab/audioUtils.mjs';
 
 const SR = 48000;
 
@@ -591,6 +591,72 @@ console.log('\n[9] 길이 바꾸기 — 속도 바꾸기와 타임 스트레치'
     check('8.90초는 4마디(8초)로 붙는다', Math.abs(snap(8.9) - 8) < 1e-9, `${snap(8.9)}`);
     check('9.10초는 5마디(10초)로 붙는다', Math.abs(snap(9.1) - 10) < 1e-9, `${snap(9.1)}`);
     check('아주 짧아도 한 마디 밑으로는 안 간다', Math.abs(snap(0.2) - bar) < 1e-9, `${snap(0.2)}`);
+  }
+}
+
+
+console.log('\n[10] 담을 때 자동 손질 — 모노로 내리기 · 규격 맞추기');
+{
+  /** 좌우가 완전히 같은 스테레오 — 모노를 스테레오 그릇에 담아 온 것 */
+  const fakeStereo = () => {
+    const b = tone(440, 1, 2);
+    b.getChannelData(1).set(b.getChannelData(0));
+    return b;
+  };
+  /** 진짜 스테레오 — 좌우가 다른 소리 */
+  const realStereo = () => {
+    const b = new FakeBuffer(2, SR, SR);
+    for (let i = 0; i < SR; i++) {
+      b.getChannelData(0)[i] = Math.sin(2 * Math.PI * 440 * i / SR) * 0.5;
+      b.getChannelData(1)[i] = Math.sin(2 * Math.PI * 660 * i / SR) * 0.5;
+    }
+    return b;
+  };
+
+  check('좌우가 같으면 차이가 0', channelDifference(fakeStereo()) < 1e-9, `${channelDifference(fakeStereo())}`);
+  check('진짜 스테레오는 문턱을 훌쩍 넘는다',
+    channelDifference(realStereo()) > MONO_IDENTICAL_THRESHOLD * 50,
+    `${channelDifference(realStereo()).toFixed(4)} (문턱 ${MONO_IDENTICAL_THRESHOLD})`);
+  check('모노는 차이가 0', channelDifference(tone(440, 1)) === 0);
+
+  // 좌우가 같은 것을 내리면 **잃는 것이 없어야** 한다
+  {
+    const src = fakeStereo();
+    const mono = downmixToMono(src, ctx);
+    check('내리면 1채널', mono.numberOfChannels === 1 && mono.length === src.length);
+    let maxDiff = 0;
+    for (let i = 0; i < mono.length; i++) maxDiff = Math.max(maxDiff, Math.abs(mono.getChannelData(0)[i] - src.getChannelData(0)[i]));
+    check('좌우가 같으면 내려도 파형이 그대로', maxDiff < 1e-6, `최대 차 ${maxDiff.toExponential(1)}`);
+    check('피크도 그대로', Math.abs(peakOf(mono) - peakOf(src)) < 1e-6);
+  }
+  {
+    // 다른 채널은 평균 — Web Audio 기본 다운믹스와 같은 규칙
+    const b = new FakeBuffer(2, 100, SR);
+    b.getChannelData(0).fill(0.4);
+    b.getChannelData(1).fill(0.8);
+    const mono = downmixToMono(b, ctx);
+    check('다른 채널은 평균으로 섞인다', Math.abs(mono.getChannelData(0)[10] - 0.6) < 1e-6, `${mono.getChannelData(0)[10]}`);
+  }
+  check('모노를 내려도 그대로', downmixToMono(tone(440, 1), ctx).numberOfChannels === 1);
+
+  // 규격 맞추기 — Veo 클립처럼 아주 조용한 것을 -3 dBFS 로
+  {
+    const quiet = tone(440, 1, 1, 0.0555);   // 실측한 Veo 클립 피크 (-25.12 dBFS)
+    const before = 20 * Math.log10(peakOf(quiet));
+    applyNormalizeToDbfs(quiet, -3);
+    const after = 20 * Math.log10(peakOf(quiet));
+    check('조용한 클립이 규격으로 올라간다', Math.abs(after + 3) < 0.01, `${before.toFixed(2)} → ${after.toFixed(2)} dBFS`);
+  }
+  {
+    // 이미 넘친 것도 내려서 맞춘다
+    const loud = tone(440, 1, 1, 0.99);
+    applyNormalizeToDbfs(loud, -3);
+    check('큰 것은 내려서 맞춘다', Math.abs(20 * Math.log10(peakOf(loud)) + 3) < 0.01);
+  }
+  {
+    const silent = dc(0, 1);
+    applyNormalizeToDbfs(silent, -3);
+    check('무음은 안 건드린다 (0 으로 나누지 않는다)', peakOf(silent) === 0);
   }
 }
 
