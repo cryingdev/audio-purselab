@@ -151,6 +151,30 @@ const CompositionTimeline: React.FC<Props> = ({
   const [drag, setDrag] = useState<{ id: string; startSec: number; lane: number } | null>(null);
   const [panning, setPanning] = useState(false);
 
+  /*
+   * 트랙 빼기는 두 번 눌러야 한다. 전에는 부모가 `confirm()` 을 띄웠는데,
+   * **대화상자가 막히는 자리에서는 `confirm` 이 곧바로 false 를 돌려주므로
+   * ✕ 를 눌러도 아무 일도 안 일어난 것처럼 보였다.** 초기화와 같은 증상이라
+   * 같은 방식으로 고친다 — 확인을 버튼 안으로 들여온다.
+   *
+   * 빈 트랙은 물어보지 않는다. 잃을 것이 없다.
+   */
+  const [armedLane, setArmedLane] = useState<number | null>(null);
+  const armTimer = useRef<number | null>(null);
+  useEffect(() => () => { if (armTimer.current !== null) clearTimeout(armTimer.current); }, []);
+
+  const askRemoveTrack = (lane: number, hasClips: boolean) => {
+    if (armTimer.current !== null) clearTimeout(armTimer.current);
+    if (!hasClips || armedLane === lane) {
+      setArmedLane(null);
+      onRemoveTrack(lane);
+      return;
+    }
+    setArmedLane(lane);
+    // 물어본 채로 오래 두지 않는다 — 다음에 눌렀을 때 지워지면 놀란다.
+    armTimer.current = window.setTimeout(() => setArmedLane(null), 4000);
+  };
+
   // 폭이 정해져야 초→픽셀 환산이 나온다. 창이 바뀌면 다시 잰다.
   useEffect(() => {
     const el = scrollRef.current;
@@ -442,13 +466,30 @@ const CompositionTimeline: React.FC<Props> = ({
                   >
                     ↓
                   </button>
-                  <button
-                    onClick={() => onRemoveTrack(lane)}
-                    className="px-1 leading-none py-0.5 bg-rose-500/10 hover:bg-rose-500/25 text-rose-400 rounded border border-rose-500/30 text-[9px] font-black transition-all"
-                    title="이 트랙을 통째로 뺀다 (올라간 클립도 함께 지우고 아래 트랙이 올라온다)"
-                  >
-                    ✕
-                  </button>
+                  {(() => {
+                    const doomed = clips.filter(c => c.lane === lane).length;
+                    const armed = armedLane === lane;
+                    return (
+                      <button
+                        onClick={() => askRemoveTrack(lane, doomed > 0)}
+                        onBlur={() => setArmedLane(null)}
+                        className={`px-1 leading-none py-0.5 rounded border text-[9px] font-black transition-all whitespace-nowrap ${
+                          armed
+                            ? 'bg-rose-600 text-white border-rose-400'
+                            : 'bg-rose-500/10 hover:bg-rose-500/25 text-rose-400 border-rose-500/30'
+                        }`}
+                        title={
+                          armed
+                            ? `한 번 더 누르면 트랙 ${lane} 과 클립 ${doomed}개가 지워집니다 (되돌리기로 살릴 수 있습니다)`
+                            : doomed > 0
+                              ? `이 트랙을 통째로 뺀다 — 클립 ${doomed}개도 함께 지워지고 아래 트랙이 올라온다. 두 번 눌러야 지워진다.`
+                              : '빈 트랙을 뺀다 (잃을 것이 없어 바로 빠진다)'
+                        }
+                      >
+                        {armed ? `✕ ${doomed}개 지움?` : '✕'}
+                      </button>
+                    );
+                  })()}
                 </div>
               )}
               {/* 빈 트랙 만들기·빼기를 보고 있는 자리에 둔다 */}

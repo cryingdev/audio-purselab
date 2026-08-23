@@ -802,21 +802,40 @@ const App: React.FC = () => {
     }
   };
 
+  /*
+   * 선택이 마디에 맞는지 미리 재 둔다. 버튼 라벨이 이 값으로 바뀌므로
+   * 누르기 전에 어긋난 것을 볼 수 있다 — 전에는 누른 뒤에야 대화상자로 알렸다.
+   */
+  const loopBars = editRegion ? barsBetween(editRegion.start, editRegion.end, loop.bpm, loop.beatsPerBar) : null;
+  const loopOffGrid = loopBars !== null && Math.abs(loopBars - Math.round(loopBars)) > 0.01;
+  const [loopArmed, setLoopArmed] = useState(false);
+  const loopTimer = useRef<number | null>(null);
+
+  // 구간이 바뀌면 물어본 것을 무른다 — 다른 구간에 대고 답한 셈이 된다.
+  useEffect(() => { setLoopArmed(false); }, [editRegion?.start, editRegion?.end]);
+
   /** 선택을 루프로 확정한다. 뒤쪽 foldMs 를 앞머리에 접어 이음매를 잇는다. */
   const handleMakeLoopAction = () => {
     const region = editRegion;
     if (!region) return;
-    const bars = barsBetween(region.start, region.end, loop.bpm, loop.beatsPerBar);
-    const off = Math.abs(bars - Math.round(bars));
-    if (off > 0.01 && !confirm(
-      `선택이 ${bars.toFixed(3)} 마디입니다 — 마디 경계에 안 맞습니다.\n` +
-      `이대로 자르면 루프가 돌 때 박자가 어긋납니다. 계속할까요?`
-    )) return;
+    /*
+     * 마디에 안 맞으면 두 번 눌러야 한다. 전에는 `confirm()` 으로 물었는데,
+     * **대화상자가 막히는 자리에서는 곧바로 false 가 돌아와 버튼을 눌러도
+     * 아무 일도 안 일어난 것처럼 보였다.** 확인을 버튼 안으로 들여왔다.
+     */
+    if (loopOffGrid && !loopArmed) {
+      setLoopArmed(true);
+      if (loopTimer.current !== null) clearTimeout(loopTimer.current);
+      loopTimer.current = window.setTimeout(() => setLoopArmed(false), 4000);
+      return;
+    }
+    if (loopTimer.current !== null) clearTimeout(loopTimer.current);
+    setLoopArmed(false);
     /*
       구간을 받은 곳과 자르는 곳의 좌표계를 맞춘다 — 트랙에서 골랐으면 클립을,
       합친 트랙에서 골랐으면 합친 트랙을 자른다. 섞으면 엉뚱한 자리가 잘린다.
     */
-    performProcessing(`루프 제작 (${Math.round(bars)}마디, 꼬리 ${loop.foldMs} ms)…`, (buffer, ctx) =>
+    performProcessing(`루프 제작 (${Math.round(loopBars ?? 0)}마디, 꼬리 ${loop.foldMs} ms)…`, (buffer, ctx) =>
       makeSeamlessLoop(buffer, region.start, region.end, loop.foldMs, ctx),
       { target: comp.clips.length > 0 ? 'clip' : 'merged' }
     );
@@ -1764,11 +1783,23 @@ const App: React.FC = () => {
                     {numField('꼬리 접기', loop.foldMs, v => setLoop(p => ({ ...p, foldMs: Math.max(0, v) })), { suffix: 'ms', width: 'w-20' })}
                     <button
                       onClick={handleMakeLoopAction}
+                      onBlur={() => setLoopArmed(false)}
                       disabled={!editRegion || audio.isProcessing}
-                      className="flex items-center gap-1.5 px-4 py-2 bg-violet-600 hover:bg-violet-500 disabled:opacity-30 text-white rounded-xl border border-violet-400 text-[10px] font-black uppercase tracking-widest transition-all"
-                      title="선택을 루프로 확정하고 뒤쪽 꼬리를 앞머리에 접는다"
+                      className={`flex items-center gap-1.5 px-4 py-2 disabled:opacity-30 text-white rounded-xl border text-[10px] font-black uppercase tracking-widest transition-all ${
+                        loopArmed
+                          ? 'bg-amber-600 hover:bg-amber-500 border-amber-400'
+                          : 'bg-violet-600 hover:bg-violet-500 border-violet-400'
+                      }`}
+                      title={
+                        loopArmed
+                          ? `선택이 ${loopBars?.toFixed(3)} 마디라 경계에 안 맞습니다. 이대로 자르면 루프가 돌 때 박자가 어긋납니다 — 한 번 더 누르면 그대로 자릅니다.`
+                          : loopOffGrid
+                            ? `선택이 ${loopBars?.toFixed(3)} 마디입니다 — 마디 경계에 안 맞습니다. 두 번 눌러야 잘립니다.`
+                            : '선택을 루프로 확정하고 뒤쪽 꼬리를 앞머리에 접는다'
+                      }
                     >
-                      <Scissors className="w-3.5 h-3.5" /> 루프 제작
+                      <Scissors className="w-3.5 h-3.5" />
+                      {loopArmed ? '마디가 안 맞습니다 — 한 번 더' : '루프 제작'}
                     </button>
                   </>)}
 
@@ -1830,11 +1861,8 @@ const App: React.FC = () => {
                       onAddLane={() => setComp(p => ({ ...p, minLanes: Math.max(usedLanes, p.minLanes) + 1 }))}
                       onRemoveLane={() => setComp(p => ({ ...p, minLanes: Math.max(usedLanes, p.minLanes - 1) }))}
                       onMoveLane={(from, to) => commitClips(moveTrack(comp.clips, from, to))}
+                      /* 확인은 ✕ 버튼 안에서 두 번 눌러 받는다 — 대화상자에 기대지 않는다. */
                       onRemoveTrack={(lane) => {
-                        const doomed = comp.clips.filter(c => c.lane === lane);
-                        if (doomed.length > 0 && !confirm(
-                          `트랙 ${lane} 을 뺍니다. 올라가 있는 클립 ${doomed.length}개도 함께 지워지고 아래 트랙이 올라옵니다.\n되돌리기로 살릴 수 있습니다. 계속할까요?`
-                        )) return;
                         commitClips(removeTrack(comp.clips, lane));
                         setComp(p => ({ ...p, minLanes: Math.max(0, p.minLanes - 1) }));
                         setSelection(null);
