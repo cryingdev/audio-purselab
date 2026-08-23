@@ -18,6 +18,8 @@ import {
   Download,
   X,
   Wind,
+  AlertTriangle,
+  Info,
   SkipBack,
   History,
   Volume1,
@@ -265,6 +267,27 @@ const App: React.FC = () => {
    */
   const dockRef = useRef<HTMLDivElement>(null);
   const [dockHeight, setDockHeight] = useState(0);
+
+  /*
+   * 알림 줄. `alert()` 아홉 군데를 여기로 옮겼다.
+   *
+   * 네이티브 대화상자는 **막히는 자리에서 통째로 사라진다** — 초기화·트랙 빼기가
+   * 그래서 안 되는 것처럼 보였다. 안내는 동작을 막지는 않지만, 막히면 왜 안 되는지
+   * 알 길이 없어진다. 게다가 대화상자는 초점을 빼앗아 편집 흐름을 끊는다.
+   *
+   * **도크 위에 띄운다** — 도크가 없는 빈 상태(첫 임포트가 실패하는 자리가 바로
+   * 여기다)에서도 보여야 하므로 화면 아래에 못 박고, 도크가 있으면 그 높이만큼
+   * 올린다. 어긋난 값 하나를 알리려고 화면 한가운데를 가릴 이유가 없다.
+   */
+  const [notice, setNotice] = useState<{ text: string; kind: 'info' | 'error' } | null>(null);
+  const noticeTimer = useRef<number | null>(null);
+  const showNotice = useCallback((text: string, kind: 'info' | 'error' = 'info') => {
+    setNotice({ text, kind });
+    if (noticeTimer.current !== null) clearTimeout(noticeTimer.current);
+    // 오류는 읽을 것이 많다 — 안내보다 오래 둔다.
+    noticeTimer.current = window.setTimeout(() => setNotice(null), kind === 'error' ? 9000 : 5000);
+  }, []);
+  useEffect(() => () => { if (noticeTimer.current !== null) clearTimeout(noticeTimer.current); }, []);
   useEffect(() => {
     const el = dockRef.current;
     if (!el) { setDockHeight(0); return; }
@@ -613,7 +636,7 @@ const App: React.FC = () => {
     if (comp.clips.length > 0 && opts.target !== 'merged') {
       const clip = editTargetClip;
       if (!clip) {
-        alert('편집할 클립을 고르십시오 — 트랙에서 클립을 누르거나 구간을 그으면 됩니다.');
+        showNotice('편집할 클립을 고르십시오 — 트랙에서 클립을 누르거나 구간을 그으면 됩니다.');
         return;
       }
       setAudio(prev => ({ ...prev, isProcessing: true, processingMsg: msg }));
@@ -890,7 +913,7 @@ const App: React.FC = () => {
       if (bake) await bakeComposition(next);
     } catch (e: any) {
       setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
-      alert(`디코드할 수 없습니다: ${e?.message ?? e}\n\n브라우저가 못 여는 코덱이면 이 파일만 ffmpeg 으로 wav 를 뽑아 주십시오.`);
+      showNotice(`디코드할 수 없습니다: ${e?.message ?? e} — 브라우저가 못 여는 코덱이면 이 파일만 ffmpeg 으로 wav 를 뽑아 주십시오.`, 'error');
     }
   };
 
@@ -992,7 +1015,7 @@ const App: React.FC = () => {
     const picked = Array.from(files);
     const notMedia = picked.find(f => !f.type.startsWith('audio/') && !f.type.startsWith('video/'));
     if (notMedia) {
-      alert(`오디오나 영상 파일이 아닙니다: ${notMedia.name} (${notMedia.type || '알 수 없는 형식'})`);
+      showNotice(`오디오나 영상 파일이 아닙니다: ${notMedia.name} (${notMedia.type || '알 수 없는 형식'})`, 'error');
       return;
     }
     const anyVideo = picked.some(f => f.type.startsWith('video/'));
@@ -1028,7 +1051,7 @@ const App: React.FC = () => {
       }
     } catch (e: any) {
       setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
-      alert(`디코드할 수 없습니다: ${e?.message ?? e}\n\n브라우저가 못 여는 코덱이면 이 파일만 ffmpeg 으로 wav 를 뽑아 주십시오.`);
+      showNotice(`디코드할 수 없습니다: ${e?.message ?? e} — 브라우저가 못 여는 코덱이면 이 파일만 ffmpeg 으로 wav 를 뽑아 주십시오.`, 'error');
     }
   };
 
@@ -1041,7 +1064,7 @@ const App: React.FC = () => {
       c.id === selectedClipId && c.startSec < at && clipEndSec(c) > at
     ) ?? comp.clips.find(c => c.startSec < at && clipEndSec(c) > at);
     if (!clip) {
-      alert('재생 헤드가 클립 위에 있어야 쪼갤 수 있습니다.\n눈금을 눌러 헤드를 옮기십시오.');
+      showNotice('재생 헤드가 클립 위에 있어야 쪼갤 수 있습니다 — 눈금을 눌러 헤드를 옮기십시오.');
       return;
     }
     const ctx = makeContext();
@@ -1067,7 +1090,7 @@ const App: React.FC = () => {
   const handleRippleDelete = () => {
     const clip = comp.clips.find(c => c.id === selectedClipId);
     if (!clip) {
-      alert('뺄 클립을 먼저 고르십시오.');
+      showNotice('뺄 클립을 먼저 고르십시오.');
       return;
     }
     commitClips(rippleDelete(comp.clips, clip.id));
@@ -1104,7 +1127,7 @@ const App: React.FC = () => {
 
   const handleCopyRange = () => {
     if (!putRegionOnClipboard()) {
-      alert('먼저 트랙에서 구간을 그으십시오 — “구간 선택” 모드로 끌면 됩니다.');
+      showNotice('먼저 트랙에서 구간을 그으십시오 — “구간 선택” 모드로 끌면 됩니다.');
     }
   };
 
@@ -1125,7 +1148,7 @@ const App: React.FC = () => {
     }
     const clip = comp.clips.find(c => c.id === selectedClipId);
     if (!clip) {
-      alert('먼저 구간을 긋거나 클립을 고르십시오.');
+      showNotice('먼저 구간을 긋거나 클립을 고르십시오.');
       return;
     }
     setComp(prev => ({ ...prev, clipboard: { ...clip, id: newClipId(), startSec: 0 } }));
@@ -1335,7 +1358,7 @@ const App: React.FC = () => {
   const handleToggleMono = async () => {
     const clip = editTargetClip;
     if (comp.clips.length > 0 && !clip) {
-      alert('먼저 트랙에서 클립을 고르십시오.');
+      showNotice('먼저 트랙에서 클립을 고르십시오.');
       return;
     }
     performProcessing('모노로 내리는 중…', (buffer, ctx) => mixBufferToMono(buffer, ctx));
@@ -2384,6 +2407,33 @@ const App: React.FC = () => {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/*
+        알림 줄. 도크 위에 뜨고, 도크가 없는 빈 상태(첫 임포트가 실패하는 자리)에서는
+        화면 맨 아래에 붙는다. `alert()` 처럼 초점을 빼앗지 않으므로 편집 흐름이 안 끊긴다.
+        누르면 바로 닫힌다 — 읽고 나서 사라질 때까지 기다릴 이유가 없다.
+      */}
+      {notice && (
+        <div
+          className="fixed left-1/2 -translate-x-1/2 z-50 max-w-[min(92vw,44rem)] px-4"
+          style={{ bottom: dockHeight + 14 }}
+        >
+          <button
+            onClick={() => setNotice(null)}
+            className={`w-full text-left flex items-start gap-2.5 px-4 py-2.5 rounded-xl border backdrop-blur-xl shadow-2xl text-xs font-bold leading-relaxed transition-all ${
+              notice.kind === 'error'
+                ? 'bg-rose-950/90 border-rose-500/50 text-rose-200'
+                : 'bg-slate-800/95 border-slate-600 text-slate-200'
+            }`}
+            title="눌러서 닫기"
+          >
+            {notice.kind === 'error'
+              ? <AlertTriangle className="w-4 h-4 shrink-0 mt-px text-rose-400" />
+              : <Info className="w-4 h-4 shrink-0 mt-px text-indigo-400" />}
+            <span className="min-w-0">{notice.text}</span>
+          </button>
         </div>
       )}
 
