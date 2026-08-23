@@ -348,6 +348,14 @@ export function applySpeedChange(buffer: AudioBuffer, ratio: number, audioCtx: A
   return out;
 }
 
+/**
+ * 타임 스트레치의 조각 길이. 자료에 맞춰 고른다 — 짧으면 타격음이 안 번지고,
+ * 길면 지속음이 매끄럽다. 화면과 함수가 같은 값을 봐야 하므로 여기 둔다.
+ */
+export const TIME_STRETCH_FRAME_MS_DEFAULT = 20;
+export const TIME_STRETCH_FRAME_MS_MIN = 5;
+export const TIME_STRETCH_FRAME_MS_MAX = 200;
+
 /** 50% 겹침에서 합이 1 이 되는 창. 겹쳐 더한 뒤 창 합으로 나누므로 가장자리도 안 파인다. */
 function hannWindow(n: number): Float32Array {
   const w = new Float32Array(n);
@@ -367,10 +375,28 @@ function hannWindow(n: number): Float32Array {
  * **스테레오는 두 채널을 같은 자리에서 가져온다.** 채널마다 따로 찾으면 좌우가
  * 다른 지점을 쓰게 되어 음상이 찢어진다 — 닮은 정도는 두 채널을 더한 것에서 잰다.
  *
- * 품질은 자료를 탄다. 환경음·바람·웅성거림은 잘 늘어나고, 말굽 같은 짧은 타격음은
- * ±10% 를 넘으면 두 번 친 것처럼 들리며, 음악은 ±8% 안쪽이 한계다.
+ * **조각 길이(`frameMs`)가 품질을 가른다.** 아래위로 이유가 다르다:
+ *
+ * - **아래쪽 한계는 저역이 정한다.** 조각이 한 주기보다 짧으면 그 주파수가 통째로
+ *   사라진다. 실측: 50 Hz(주기 20 ms)가 든 자료를 5 ms 조각으로 늘렸더니 50 Hz
+ *   성분이 0.2250 → 0.0023 으로 **약 40 dB 죽었다.** 20 ms 조각에서는 그대로였다.
+ * - **위쪽은 길수록 거칠어진다.** 50% 겹침에서 한 번의 정렬로 긴 구간을 다 맞출 수
+ *   없기 때문이다. 실측(×1.3, 포락선 흔들림): 20 ms 0.34% · 43 ms 3.14% ·
+ *   80 ms 6.09% · 200 ms 8.97% (원본 0.35%). 탐색 폭을 조각에 비례시켜도
+ *   그대로였으므로(8.96%) 탐색 범위 탓이 아니라 겹쳐 붙이기의 성질이다.
+ * - 긴 조각은 **타격음도 번진다.** 홀로 있는 타격음을 2.5배로 늘렸을 때 120 ms
+ *   조각에서는 봉우리가 **두 개**가 됐고, 20 ms 에서는 하나로 남았다.
+ *
+ * 그래서 기본은 **20 ms** 다 — 50 Hz 까지 담으면서 가장 매끄러웠다. 더 깊은 저역이
+ * 든 자료(20 Hz 대 럼블)라면 40~60 ms 로 올린다. 저역이 아예 없는 자료라면
+ * 10 ms 로 내려도 된다.
  */
-export function timeStretch(buffer: AudioBuffer, ratio: number, audioCtx: AudioContext): AudioBuffer {
+export function timeStretch(
+  buffer: AudioBuffer,
+  ratio: number,
+  audioCtx: AudioContext,
+  frameMs = TIME_STRETCH_FRAME_MS_DEFAULT
+): AudioBuffer {
   const chans = buffer.numberOfChannels;
   const inLen = buffer.length;
   const outLen = Math.max(1, Math.round(inLen * ratio));
@@ -382,10 +408,17 @@ export function timeStretch(buffer: AudioBuffer, ratio: number, audioCtx: AudioC
     return same;
   }
 
-  const FRAME = 2048;             // 48 kHz 에서 약 43 ms
+  /*
+   * 조각은 **짝수 표본**이어야 한다 — 절반씩 겹치므로 홀수면 겹침이 어긋난다.
+   * 아래위로 묶는다: 5 ms 밑은 조각이 파형 한 주기도 못 담고, 200 ms 위는
+   * 어느 자료에서든 번져서 쓸 수가 없다.
+   */
+  const ms = Math.min(TIME_STRETCH_FRAME_MS_MAX, Math.max(TIME_STRETCH_FRAME_MS_MIN, frameMs));
+  const FRAME = Math.max(128, Math.round((ms / 1000) * buffer.sampleRate / 2) * 2);
   const HOP_OUT = FRAME >> 1;     // 50% 겹침
   const OVERLAP = FRAME - HOP_OUT;
-  const SEARCH = 480;             // ±10 ms. 100 Hz 주기까지 덮는다
+  // 찾는 폭은 ±10 ms (100 Hz 주기까지 덮는다). 조각보다 넓게 찾을 이유는 없다.
+  const SEARCH = Math.min(Math.round(0.010 * buffer.sampleRate), FRAME);
   const COARSE = 8;               // 성기게 훑고 그 근처만 촘촘히 — 전수 탐색은 너무 느리다
 
   const out = audioCtx.createBuffer(chans, outLen, buffer.sampleRate);

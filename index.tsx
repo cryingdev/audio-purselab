@@ -56,6 +56,9 @@ import {
   applyGainCapped,
   applySpeedChange,
   timeStretch,
+  TIME_STRETCH_FRAME_MS_DEFAULT,
+  TIME_STRETCH_FRAME_MS_MIN,
+  TIME_STRETCH_FRAME_MS_MAX,
   makeContext,
   decodeFileToBuffer,
   suggestAssetName,
@@ -1354,6 +1357,11 @@ const App: React.FC = () => {
   /** 목표 길이(초). 클립을 바꾸면 그 클립의 길이로 다시 맞춘다. */
   const [targetLenSec, setTargetLenSec] = useState(0);
   const [keepPitch, setKeepPitch] = useState(true);
+  /*
+   * 겹쳐 붙일 조각의 길이. 자료가 정한다 — 아래쪽 한계는 **저역의 한 주기**이고
+   * (그보다 짧으면 그 주파수가 통째로 사라진다), 위로 갈수록 거칠어진다.
+   */
+  const [stretchFrameMs, setStretchFrameMs] = useState(TIME_STRETCH_FRAME_MS_DEFAULT);
   const editClipDur = editTargetClip?.buffer.duration ?? null;
   useEffect(() => {
     if (editClipDur !== null) setTargetLenSec(Math.round(editClipDur * 1000) / 1000);
@@ -1383,8 +1391,9 @@ const App: React.FC = () => {
      * (환경음은 잘 되고, 짧은 타격음은 ±10% 를 넘으면 두 번 친 것처럼 들린다).
      */
     performProcessing(
-      `${keepPitch ? '길이만' : '속도'} ${targetLenSec.toFixed(3)}초로…`,
-      (buffer, ctx) => (keepPitch ? timeStretch(buffer, lenRatio, ctx) : applySpeedChange(buffer, lenRatio, ctx))
+      `${keepPitch ? `길이만 (조각 ${stretchFrameMs} ms)` : '속도'} ${targetLenSec.toFixed(3)}초로…`,
+      (buffer, ctx) =>
+        keepPitch ? timeStretch(buffer, lenRatio, ctx, stretchFrameMs) : applySpeedChange(buffer, lenRatio, ctx)
     );
   };
 
@@ -2097,6 +2106,37 @@ const App: React.FC = () => {
                         음정 유지
                       </span>
                     </label>
+                    {/*
+                      조각 길이는 **음정 유지일 때만** 뜻이 있다. 속도 바꾸기는
+                      겹쳐 붙이지 않으므로 이 값을 안 쓴다 — 안 쓰는 칸을 띄워 두면
+                      켜고 끌 때마다 무엇이 살아 있는지 헷갈린다.
+                    */}
+                    {keepPitch && (
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[9px] font-black text-slate-500 tracking-widest px-1">
+                          조각 {stretchFrameMs} ms
+                          <span className="ml-1 font-mono text-slate-600">
+                            ≥{Math.round(1000 / stretchFrameMs)} Hz
+                          </span>
+                        </span>
+                        <input
+                          type="range"
+                          min={TIME_STRETCH_FRAME_MS_MIN}
+                          max={TIME_STRETCH_FRAME_MS_MAX}
+                          step={1}
+                          value={stretchFrameMs}
+                          onChange={(e) => setStretchFrameMs(parseInt(e.target.value, 10))}
+                          className="w-28 accent-emerald-500 cursor-pointer"
+                          title={
+                            '겹쳐 붙일 조각의 길이. 자료가 정한다.\n' +
+                            '• 조각이 한 주기보다 짧으면 그 저역이 통째로 사라진다 — 5 ms 는 50 Hz 를 40 dB 죽인다.\n' +
+                            '• 길수록 거칠어진다 (실측 ×1.3: 20 ms 0.34% · 43 ms 3.14% · 200 ms 8.97%).\n' +
+                            '• 긴 조각은 타격음도 번진다.\n' +
+                            '기본 20 ms 는 50 Hz 까지 담는다. 더 깊은 럼블이면 40~60 ms 로 올린다.'
+                          }
+                        />
+                      </label>
+                    )}
                     <button
                       onClick={handleLengthAction}
                       disabled={!editTargetClip || audio.isProcessing || !lenRatioOk || (lenRatio !== null && Math.abs(lenRatio - 1) < 1e-4)}

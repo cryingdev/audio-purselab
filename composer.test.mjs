@@ -3,7 +3,7 @@ import {
   appendStartSec, wrapLoopEnds, clipEndSec, placeOnNewLanes,
   splitClipAt, rippleInsert, rippleDelete, moveTrack, removeTrack, placeClips
 } from './node_modules/.pulselab/composer.mjs';
-import { suggestAssetName, applyReverse, applyGainCapped, peakOfRange, applySpeedChange, timeStretch, barSeconds } from './node_modules/.pulselab/audioUtils.mjs';
+import { suggestAssetName, applyReverse, applyGainCapped, peakOfRange, applySpeedChange, timeStretch, barSeconds, TIME_STRETCH_FRAME_MS_DEFAULT } from './node_modules/.pulselab/audioUtils.mjs';
 
 const SR = 48000;
 
@@ -525,6 +525,61 @@ console.log('\n[9] 길이 바꾸기 — 속도 바꾸기와 타임 스트레치'
     const src = tone(440, 1);
     const same = timeStretch(src, 1, ctx);
     check('스트레치 ×1 은 그대로 통과', same.length === src.length && Math.abs(same.getChannelData(0)[500] - src.getChannelData(0)[500]) < 1e-9);
+  }
+
+  // --- 조각 길이 ---
+  {
+    /** 특정 주파수 성분의 세기 (한 점 DFT). 조각이 한 주기보다 짧으면 죽는다. */
+    const at = (b, hz) => {
+      const x = b.getChannelData(0);
+      let re = 0, im = 0;
+      for (let i = 0; i < x.length; i++) {
+        const w = (2 * Math.PI * hz * i) / SR;
+        re += x[i] * Math.cos(w); im += x[i] * Math.sin(w);
+      }
+      return Math.sqrt(re * re + im * im) / x.length;
+    };
+    /** 포락선 흔들림(%) — 이어 붙인 자리가 거칠수록 커진다. */
+    const ripple = (b) => {
+      const x = b.getChannelData(0), H = 480, n = Math.floor(x.length / H), e = [];
+      for (let i = 0; i < n; i++) {
+        let s = 0;
+        for (let j = i * H; j < (i + 1) * H; j++) s += x[j] * x[j];
+        e.push(Math.sqrt(s / H));
+      }
+      const m = e.reduce((a, v) => a + v, 0) / e.length;
+      return (Math.sqrt(e.reduce((a, v) => a + (v - m) ** 2, 0) / e.length) / m) * 100;
+    };
+    // 50 Hz(주기 20 ms) 저역이 든 자료
+    const lowMat = () => {
+      const b = dc(0, 2), d = b.getChannelData(0);
+      let seed = 7;
+      const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed / 0x7fffffff) * 2 - 1; };
+      for (let i = 0; i < d.length; i++) {
+        d[i] = Math.sin((2 * Math.PI * 50 * i) / SR) * 0.45 + Math.sin((2 * Math.PI * 400 * i) / SR) * 0.2 + rnd() * 0.05;
+      }
+      return b;
+    };
+
+    const src50 = at(lowMat(), 50);
+    const short5 = at(timeStretch(lowMat(), 1.3, ctx, 5), 50);
+    const ok20 = at(timeStretch(lowMat(), 1.3, ctx, 20), 50);
+    check('조각이 한 주기보다 짧으면 저역이 죽는다 (5 ms · 50 Hz)',
+      short5 < src50 * 0.05, `${src50.toFixed(4)} → ${short5.toFixed(4)}`);
+    check('한 주기를 담으면 저역이 남는다 (20 ms · 50 Hz)',
+      ok20 > src50 * 0.95, `${src50.toFixed(4)} → ${ok20.toFixed(4)}`);
+
+    const r20 = ripple(timeStretch(lowMat(), 1.3, ctx, 20));
+    const r200 = ripple(timeStretch(lowMat(), 1.3, ctx, 200));
+    check('조각이 길수록 거칠어진다 (20 ms < 200 ms)', r20 < r200 / 3, `${r20.toFixed(2)}% vs ${r200.toFixed(2)}%`);
+
+    check('기본 조각은 20 ms', TIME_STRETCH_FRAME_MS_DEFAULT === 20, `${TIME_STRETCH_FRAME_MS_DEFAULT}`);
+
+    // 폭 밖의 값은 묶인다 — 길이는 그래도 정확해야 한다
+    for (const fm of [0, -5, 5000]) {
+      const out = timeStretch(tone(440, 1), 1.2, ctx, fm);
+      check(`조각 ${fm} ms 를 줘도 길이는 맞는다`, Math.abs(out.length - Math.round(SR * 1.2)) < 2, `${out.length}`);
+    }
   }
 
   // --- 마디 스냅 ---
