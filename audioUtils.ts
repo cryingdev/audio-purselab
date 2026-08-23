@@ -48,6 +48,50 @@ export async function decodeFileToWav(
   }
 }
 
+/**
+ * 파일을 48 kHz AudioBuffer 로 연다. 병합 작업대처럼 여러 클립을 동시에
+ * 들고 있어야 하는 쪽은 Blob 이 아니라 버퍼가 필요하다.
+ *
+ * AudioBuffer 는 만들어진 컨텍스트와 수명을 같이하지 않으므로 여기서 컨텍스트를
+ * 닫아도 버퍼는 계속 쓸 수 있다.
+ */
+export async function decodeFileToBuffer(
+  file: File,
+  sampleRate = PROJECT_SAMPLE_RATE
+): Promise<AudioBuffer> {
+  const ctx = makeContext(sampleRate);
+  try {
+    return await ctx.decodeAudioData(await file.arrayBuffer());
+  } finally {
+    void ctx.close();
+  }
+}
+
+/**
+ * 원본 파일명을 저장소 관례(소문자 kebab-case + `-v1`)로 고친 **제안**을 만든다.
+ *
+ * Veo 와 Suno 가 주는 이름은 관례와 전혀 안 맞는다 —
+ * `Rain_falling_on_wheat_field_202608131645.mp4` 를 그대로 내보내면 자산 30개를
+ * 손으로 다시 이름 붙여야 한다. 뒤에 붙은 긴 숫자는 생성기가 찍은 시각이라 버린다.
+ *
+ * 어디까지나 제안이고 화면에서 고칠 수 있다 — 규칙이 못 맞히는 이름이 있기 때문이다.
+ */
+export function suggestAssetName(fileName: string): string {
+  const noExt = fileName.replace(/\.[^.]+$/, '');
+  let s = noExt
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+
+  // 생성기가 붙인 시각(8자리 이상 숫자)은 자산 이름이 아니다.
+  s = s.replace(/-\d{8,}$/, '');
+  if (!s) s = 'untitled';
+
+  // 이미 버전이 있으면 그대로 둔다.
+  return /-v\d+$/.test(s) ? s : `${s}-v1`;
+}
+
 // --- 마디 격자 ---
 
 export function barSeconds(bpm: number, beatsPerBar = 4): number {
@@ -80,8 +124,11 @@ export function peakOf(buffer: AudioBuffer): number {
 }
 
 /**
- * 피크를 목표 dBFS 로 맞춘다. 저장소 규격이 -3 dBFS 이고, 0 으로 올리는
- * applyNormalization 은 믹서에 남길 헤드룸을 없앤다.
+ * 피크를 목표 dBFS 로 맞춘다. 저장소 규격이 -3 dBFS 다.
+ *
+ * 피크를 0 dBFS 로 올리는 판(`applyNormalization`)이 따로 있었는데 지웠다 —
+ * 믹서에 남길 헤드룸을 없애서 규격을 어겼고, 화면에도 `Max` 라는 이름으로
+ * 이것과 나란히 놓여 어느 쪽이 규격인지 알 수 없었다.
  */
 export function applyNormalizeToDbfs(buffer: AudioBuffer, targetDbfs: number): AudioBuffer {
   const peak = peakOf(buffer);
@@ -200,67 +247,55 @@ export function applyFade(buffer: AudioBuffer, start: number, end: number, type:
   return buffer;
 }
 
-export function analyzeNoiseProfile(buffer: AudioBuffer, start: number, end: number): Float32Array {
-  const sampleRate = buffer.sampleRate;
-  const startOffset = Math.floor(start * sampleRate);
-  const endOffset = Math.floor(end * sampleRate);
-  
-  const data = buffer.getChannelData(0).subarray(startOffset, endOffset);
-  const profileSize = 128;
-  const profile = new Float32Array(profileSize);
-  
-  for (let i = 0; i < data.length; i++) {
-    const bin = Math.floor((i % profileSize));
-    profile[bin] += Math.abs(data[i]);
-  }
-  for (let i = 0; i < profileSize; i++) {
-    profile[i] /= (data.length / profileSize);
-  }
-  return profile;
-}
+/*
+ * `analyzeNoiseProfile` 과 `applySpectralSubtraction`(UI 의 Clean Atmosphere)은
+ * 2026-08-11 에 지웠다. 이름과 달리 스펙트럼 처리가 아니었다 — 빈을 `i % 128` 로
+ * 잡았는데 그건 주파수가 아니라 표본 인덱스라서 FFT 가 한 줄도 없었고, 노이즈를
+ * 지우는 대신 128표본 주기(48 kHz 에서 375 Hz)의 왜곡을 넣었다. 되살리려면
+ * 진짜 STFT 로 다시 쓰는 수밖에 없다.
+ */
 
-export function applySpectralSubtraction(buffer: AudioBuffer, profile: Float32Array): AudioBuffer {
-  const numChannels = buffer.numberOfChannels;
-  const profileSize = profile.length;
-  
-  for (let c = 0; c < numChannels; c++) {
+/** [start, end) 안의 피크. 구간을 안 주면 통째. */
+export function peakOfRange(buffer: AudioBuffer, start?: number, end?: number): number {
+  const sr = buffer.sampleRate;
+  const s = start !== undefined ? Math.max(0, Math.floor(start * sr)) : 0;
+  const e = end !== undefined ? Math.min(buffer.length, Math.floor(end * sr)) : buffer.length;
+  let max = 0;
+  for (let c = 0; c < buffer.numberOfChannels; c++) {
     const data = buffer.getChannelData(c);
-    for (let i = 0; i < data.length; i++) {
-      const bin = Math.floor((i % profileSize));
-      const noiseEnergy = profile[bin];
-      const sign = Math.sign(data[i]);
-      let val = Math.abs(data[i]);
-      
-      if (val < noiseEnergy * 1.5) {
-        val *= 0.1;
-      } else {
-        val -= noiseEnergy * 0.5;
-      }
-      data[i] = sign * Math.max(0, val);
-    }
-  }
-  return buffer;
-}
-
-export function applyNormalization(buffer: AudioBuffer): AudioBuffer {
-  const numChannels = buffer.numberOfChannels;
-  let maxVal = 0;
-  for (let c = 0; c < numChannels; c++) {
-    const data = buffer.getChannelData(c);
-    for (let i = 0; i < data.length; i++) {
+    for (let i = s; i < e; i++) {
       const abs = Math.abs(data[i]);
-      if (abs > maxVal) maxVal = abs;
+      if (abs > max) max = abs;
     }
   }
-  if (maxVal === 0) return buffer;
-  const multiplier = 1.0 / maxVal;
-  for (let c = 0; c < numChannels; c++) {
-    const data = buffer.getChannelData(c);
-    for (let i = 0; i < data.length; i++) {
-      data[i] *= multiplier;
-    }
-  }
-  return buffer;
+  return max;
+}
+
+/**
+ * 넘치지 않게 키운다 — **배수를 깎지, 파형을 자르지 않는다.**
+ *
+ * 그냥 곱하면 1 을 넘은 표본이 화면에는 남아 있다가 16-bit 로 쓸 때 ±1 로
+ * 잘린다. 잘린 파형은 되돌릴 수 없고 배음이 생겨 소리가 뭉갠다. 그래서
+ * **곱하기 전에** 결과 피크를 계산해서, 넘칠 배수면 천장에 딱 닿는 배수로 깎는다.
+ * 선형 배수만 바뀌므로 소리의 성질은 그대로다.
+ *
+ * 이미 천장을 넘어 있는 자료는 **더 나쁘게만 안 만든다** — 억지로 끌어내리지
+ * 않는다. 사용자가 -3 dB 를 걸었는데 -5 dB 가 걸리면 그게 더 놀랍기 때문이다.
+ * 줄이는 쪽(배수 < 1)은 애초에 깎을 일이 없다.
+ */
+export function applyGainCapped(
+  buffer: AudioBuffer,
+  multiplier: number,
+  ceiling: number,
+  start?: number,
+  end?: number
+): { buffer: AudioBuffer; requested: number; applied: number; capped: boolean; peakBefore: number } {
+  const peakBefore = peakOfRange(buffer, start, end);
+  // 천장은 "지금 피크"와 "규정 천장" 중 큰 쪽 — 이미 넘은 것을 끌어내리지 않으려는 것이다.
+  const allowed = Math.max(ceiling, peakBefore);
+  const applied = peakBefore > 0 ? Math.min(multiplier, allowed / peakBefore) : multiplier;
+  applyGain(buffer, applied, start, end);
+  return { buffer, requested: multiplier, applied, capped: applied < multiplier - 1e-9, peakBefore };
 }
 
 export function applyGain(buffer: AudioBuffer, multiplier: number, start?: number, end?: number): AudioBuffer {
@@ -273,6 +308,31 @@ export function applyGain(buffer: AudioBuffer, multiplier: number, start?: numbe
     for (let i = startOffset; i < endOffset; i++) {
       if (i >= data.length) break;
       data[i] *= multiplier;
+    }
+  }
+  return buffer;
+}
+
+/**
+ * 앞뒤를 뒤집는다. 구간을 주면 그 안만, 안 주면 통째로.
+ *
+ * 표본 순서만 거꾸로 돌리므로 **표본 수도 피크도 그대로**다 — 잘려 나가는 것이 없다.
+ * 구간만 뒤집을 때는 그 바깥이 손대지지 않으므로 경계에서 파형이 튈 수 있는데,
+ * 그건 페이드로 다듬을 몫이다.
+ */
+export function applyReverse(buffer: AudioBuffer, start?: number, end?: number): AudioBuffer {
+  const sampleRate = buffer.sampleRate;
+  const rawFrom = start !== undefined ? Math.floor(start * sampleRate) : 0;
+  const rawTo = end !== undefined ? Math.floor(end * sampleRate) : buffer.length;
+  const from = Math.max(0, Math.min(rawFrom, buffer.length));
+  const to = Math.max(from, Math.min(rawTo, buffer.length));
+
+  for (let c = 0; c < buffer.numberOfChannels; c++) {
+    const data = buffer.getChannelData(c);
+    for (let i = from, j = to - 1; i < j; i++, j--) {
+      const tmp = data[i];
+      data[i] = data[j];
+      data[j] = tmp;
     }
   }
   return buffer;
@@ -353,13 +413,4 @@ export async function mixBufferToMono(buffer: AudioBuffer, audioCtx: AudioContex
   source.connect(offlineCtx.destination);
   source.start();
   return await offlineCtx.startRendering();
-}
-
-export async function mixToMono(originalUrl: string): Promise<Blob> {
-  const response = await fetch(originalUrl);
-  const arrayBuffer = await response.arrayBuffer();
-  const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-  const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-  const monoBuffer = await mixBufferToMono(audioBuffer, audioCtx);
-  return audioBufferToWav(monoBuffer);
 }

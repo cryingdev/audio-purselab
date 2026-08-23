@@ -1,4 +1,6 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import './index.css';
+
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import WaveSurfer from 'wavesurfer.js';
 import RegionsPlugin from 'wavesurfer.js/dist/plugins/regions.esm.js';
@@ -9,56 +11,49 @@ import {
   Scissors, 
   RotateCcw, 
   Volume2, 
-  Maximize,
   FileAudio,
   Merge,
   Columns,
   Loader2,
   Download,
   X,
-  Activity,
   Wind,
-  Fingerprint,
-  Sparkles,
-  TrendingUp,
-  TrendingDown,
   SkipBack,
   History,
-  Minimize2,
   Volume1,
   VolumeX,
   AudioWaveform,
   Crop,
   Undo2,
   Redo2,
-  PlayCircle,
-  SlidersHorizontal,
   Check,
   Zap,
-  Split,
-  Plus,
   Repeat,
   Grid3x3,
   Film,
   Gauge,
-  Magnet
+  Magnet,
+  Layers,
+  Trash2,
+  FlipHorizontal,
+  SeparatorVertical,
+  Copy,
+  ClipboardPaste,
+  Combine
 } from 'lucide-react';
 
 import {
   audioBufferToWav,
   applyFade,
-  analyzeNoiseProfile,
-  applySpectralSubtraction,
-  applyNormalization,
   applyNoiseGate,
+  applyReverse,
   applyCut,
   applyCrop,
   mixBufferToMono,
-  applyExtractChannel,
-  applySilenceChannel,
-  applyGain,
+  applyGainCapped,
   makeContext,
-  decodeFileToWav,
+  decodeFileToBuffer,
+  suggestAssetName,
   barSeconds,
   snapToBar,
   barsBetween,
@@ -67,6 +62,24 @@ import {
   peakOf,
   PROJECT_SAMPLE_RATE
 } from './audioUtils';
+
+import {
+  CompClip,
+  renderComposition,
+  compositionLength,
+  compositionChannels,
+  placeClips,
+  placeOnNewLanes,
+  clipEndSec,
+  wrapLoopEnds,
+  splitClipAt,
+  rippleInsert,
+  rippleDelete,
+  moveTrack,
+  removeTrack,
+} from './composer';
+import CompositionTimeline, { TrackSelection } from './CompositionTimeline';
+import { useCompositionPlayback } from './useCompositionPlayback';
 
 // --- Types ---
 
@@ -81,14 +94,10 @@ interface AudioState {
   isMono: boolean;
   isProcessing: boolean;
   processingMsg: string;
-  noiseProfile: Float32Array | null;
   volume: number;
   undoStack: string[];
   redoStack: string[];
   gateThreshold: number;
-  showGateSettings: boolean;
-  gainMultiplier: number;
-  showGainSettings: boolean;
   sourceKind: 'audio' | 'video' | null;
   channels: number;
 }
@@ -106,7 +115,46 @@ interface LoopState {
   previewLooping: boolean;
 }
 
+/** 병합 작업대. 클립을 계속 더해 가며 짜고, 마지막에 한 트랙으로 굽는다. */
+interface ComposerState {
+  clips: CompClip[];
+  /** 이어 붙일 때 이음매를 얼마나 겹칠지. */
+  crossfadeMs: number;
+  /** 끝→시작 말아들기. 0 이면 안 한다. */
+  wrapMs: number;
+  normalizeAfter: boolean;
+  /** 마지막으로 구운 결과의 피크. 1 을 넘었으면 잘렸다는 뜻이다. */
+  lastPeak: number | null;
+  /**
+   * 복사해 둔 클립. 붙여넣으면 새 레인에 같은 자리로 들어간다.
+   * 버퍼는 참조로 공유한다 — 렌더가 클립 버퍼를 읽기만 하므로 안전하고,
+   * 같은 소리를 여러 겹 쌓아도 메모리가 늘지 않는다.
+   */
+  clipboard: CompClip | null;
+  /** 무음 클립을 담을 때 쓸 길이(초). */
+  silenceSec: number;
+  /**
+   * 클립이 없어도 유지할 트랙 수. 트랙은 원래 클립에서 파생되므로
+   * (`max(clip.lane)+1`) 이 값이 없으면 빈 트랙이 존재할 수 없다.
+   */
+  minLanes: number;
+  /** 클립 편집 되돌리기. 버퍼는 참조로 공유하므로 스냅샷이 싸다. */
+  undo: CompClip[][];
+  redo: CompClip[][];
+}
+
 // --- App Component ---
+
+/*
+ * 한 번에 걸 수 있는 음량은 **0~200%** 다. 두 배(+6.02 dB)까지만 걸리고,
+ * 더 키우려면 한 번 더 건다.
+ */
+const GAIN_MAX_PCT = 200;
+const GAIN_MAX_DB = Math.round(20 * Math.log10(GAIN_MAX_PCT / 100) * 100) / 100; // 6.02
+const GAIN_MIN_DB = -100; // 0% — 16-bit 로 쓰면 어차피 0 이다
+
+/** 넘침 천장. 선형 1.0 = 0 dBFS — 이 위는 16-bit 로 쓸 때 잘려 나간다. */
+const CLIP_CEILING = 1;
 
 const App: React.FC = () => {
   const [audio, setAudio] = useState<AudioState>({
@@ -120,22 +168,29 @@ const App: React.FC = () => {
     isMono: false,
     isProcessing: false,
     processingMsg: '',
-    noiseProfile: null,
     volume: 1.0,
     undoStack: [],
     redoStack: [],
     gateThreshold: 0.01,
-    showGateSettings: false,
-    gainMultiplier: 1.0,
-    showGainSettings: false,
     sourceKind: null,
     channels: 0,
   });
 
-  const [zoom, setZoom] = useState(50);
+  /** 내보낼 이름(확장자 제외). 임포트할 때 관례에 맞게 제안하고, 손으로 고칠 수 있다. */
+  const [exportName, setExportName] = useState('');
+  /** 지금 트랙의 피크(선형). 규격(-3 dBFS)에 맞는지 화면에서 바로 보려고 잰다. */
+  const [currentPeak, setCurrentPeak] = useState<number | null>(null);
+  /** 편집 대상 클립. 클립이 문서이므로 편집은 이 클립에 걸린다. */
+  const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+
+  /**
+   * 줌은 하나다. **1× 이 "폭에 맞춤"** 이고, 트랙 파형과 아래 `합친 결과` 가
+   * 같은 값을 따른다. 예전에는 둘이 따로 놀아서 한쪽을 당겨도 다른 쪽은 그대로였다.
+   * wavesurfer 는 초당 픽셀을 받으므로 넘길 때 환산한다.
+   */
+  const [zoomFactor, setZoomFactor] = useState(1);
   const [isDragging, setIsDragging] = useState(false);
   const [activeRegion, setActiveRegion] = useState<any>(null);
-  const [showChannelSettings, setShowChannelSettings] = useState(false);
 
   const [loop, setLoop] = useState<LoopState>({
     bpm: 120,
@@ -147,6 +202,166 @@ const App: React.FC = () => {
     snapEnabled: true,
     previewLooping: false,
   });
+
+  const [comp, setComp] = useState<ComposerState>({
+    clips: [],
+    // veo-sfx-prompts.md 의 환경음 절차가 이음매를 0.5~1초로 잡는다.
+    crossfadeMs: 750,
+    wrapMs: 0,
+    normalizeAfter: true,
+    lastPeak: null,
+    clipboard: null,
+    silenceSec: 4,
+    minLanes: 0,
+    undo: [],
+    redo: [],
+  });
+
+  /** 트랙 위에서 고른 구간. 편집이 걸리는 자리다. */
+  const [selection, setSelection] = useState<TrackSelection | null>(null);
+  /** 마디 격자는 음악 루프에서만 쓰므로 접어 둘 수 있다. 기본은 접힘. */
+  const [loopLabOpen, setLoopLabOpen] = useState(false);
+  /**
+   * 음량을 얼마나 올리고 내릴지, **dB 로** 잡는다.
+   * 기존 게인은 0.1~5.0 배수라 "6 dB 줄이기"를 0.501 배로 환산해야 했다 —
+   * 오디오 작업에서 쓰는 단위로 말하게 한다.
+   */
+  const [gainDb, setGainDbRaw] = useState(0);
+  /** 걸다가 천장에 부딪혀 깎였을 때 얼마나 걸렸는지 알린다. */
+  const [gainNotice, setGainNotice] = useState<string | null>(null);
+  const setGainDb = (v: number) => {
+    setGainDbRaw(Math.min(GAIN_MAX_DB, Math.max(GAIN_MIN_DB, v)));
+    setGainNotice(null);
+  };
+
+  /*
+   * 음량을 **백분율과 dB 두 가지로** 보여 준다 — 같은 값의 두 얼굴이다.
+   * 귀에 익은 쪽은 백분율(200% = 두 배)이고, 규격(-3 dBFS)을 맞출 때 필요한 쪽은 dB 다.
+   *
+   * 참값은 dB 로 들고 슬라이더가 거기서 백분율을 뽑아 쓴다. 반대로 두면
+   * **슬라이더를 건드리지도 않았는데 dB 칸의 숫자가 반올림 때문에 흔들린다**
+   * (6 을 넣으면 199.53% 를 거쳐 5.9997 로 되돌아온다).
+   *
+   * 슬라이더 범위는 **한 번에 0~200%** (= -무한대 ~ +6.02 dB). 두 배까지만 걸리고,
+   * 더 키우려면 한 번 더 건다 — 한 번에 크게 걸수록 천장에 부딪혀 깎이는 양이
+   * 커지고, 얼마나 걸렸는지 감을 잃는다. 숫자 칸도 같은 범위로 묶는다.
+   * 0% 는 -100 dB 로 접는다 — -무한대를 숫자 칸에 넣을 수 없고,
+   * -100 dB 는 16-bit 로 쓰면 어차피 0 이다.
+   */
+  const gainPct = Math.round(Math.min(GAIN_MAX_PCT, Math.max(0, Math.pow(10, gainDb / 20) * 100)));
+  const setGainPct = (pct: number) =>
+    /*
+     * 소수 **두** 자리로 접는다. 한 자리로 접었더니 200% 가 6.0 dB 가 되어
+     * 실제로는 199.5% 가 걸렸고, 슬라이더를 400 까지 밀면 라벨이 **398%** 로
+     * 읽혔다 (12.0412 → 12.0 → 398.1). 두 자리면 6.02 · 12.04 라 백분율이
+     * 그대로 되돌아온다 — 라벨이 거짓말을 하지 않는다.
+     */
+    setGainDb(pct <= 0 ? -100 : Math.round(20 * Math.log10(pct / 100) * 100) / 100);
+  /** 병합 작업대도 접힌다 — 한 번 정해 두면 자주 안 만지는 설정과 클립 목록이다. */
+  const [mergePanelOpen, setMergePanelOpen] = useState(true);
+  /**
+   * 도크가 실제로 차지하는 높이. 좁은 화면에서는 두세 줄로 접혀 135 px 까지 커지는데
+   * 비워 두는 자리를 128 px 로 **고정해 뒀더니 아래 내용이 가려졌다.** 재서 그만큼 비운다.
+   */
+  const dockRef = useRef<HTMLDivElement>(null);
+  const [dockHeight, setDockHeight] = useState(0);
+  useEffect(() => {
+    const el = dockRef.current;
+    if (!el) { setDockHeight(0); return; }
+    const ro = new ResizeObserver(() => setDockHeight(el.offsetHeight));
+    ro.observe(el);
+    setDockHeight(el.offsetHeight);
+    return () => ro.disconnect();
+  }, [comp.clips.length]);
+
+  /**
+   * 구간을 그으면 그 구간이 덮는 클립을 편집 대상으로도 기억해 둔다.
+   * 구간 선택 중에는 클립이 포인터를 받지 않으므로(구간을 클립 위에서도 그어야 한다)
+   * 이렇게 해 두지 않으면, 편집 뒤 구간이 풀렸을 때 대상이 사라져
+   * 전체 대상 편집(정규화·게이트)이 "클립을 고르십시오"로 막힌다.
+   */
+  const handleSelectionChange = useCallback((sel: TrackSelection | null) => {
+    setSelection(sel);
+    if (!sel) return;
+    const hit = comp.clips.find(c =>
+      c.lane === sel.lane && clipEndSec(c) > sel.start && c.startSec < sel.end
+    );
+    if (hit) setSelectedClipId(hit.id);
+  }, [comp.clips]);
+
+  /** 트랙을 합치지 않고 그대로 들려준다 — 배치는 귀로 맞추는 일이다. */
+  const playback = useCompositionPlayback(comp.clips, audio.volume, comp.wrapMs);
+
+  /*
+   * 되풀이 중에 구간을 다시 그으면 루프도 따라간다. 안 그러면 옛 구간이 계속
+   * 돌아서, 방금 고친 이음매가 아니라 엉뚱한 데를 듣게 된다.
+   * 구간이 사라지면 되풀이를 끈다.
+   */
+  useEffect(() => {
+    if (!loop.previewLooping) return;
+    if (selection && selection.end > selection.start) {
+      playback.setLoopRange({ start: selection.start, end: selection.end });
+    } else {
+      playback.setLoopRange(null);
+      setLoop(prev => ({ ...prev, previewLooping: false }));
+    }
+  }, [loop.previewLooping, selection, playback.setLoopRange]);
+
+  /**
+   * 편집 대상 클립. 구간을 그었으면 그 구간이 덮는 클립이고, 아니면 눌러 둔 클립이다.
+   * 구간이 우선인 이유는, 구간을 긋는 행위 자체가 "여기를 고치겠다"는 뜻이라서다.
+   */
+  const editTargetClip = useMemo(() => {
+    if (selection) {
+      const hit = comp.clips.find(c =>
+        c.lane === selection.lane && clipEndSec(c) > selection.start && c.startSec < selection.end
+      );
+      if (hit) return hit;
+    }
+    return comp.clips.find(c => c.id === selectedClipId) ?? null;
+  }, [comp.clips, selection, selectedClipId]);
+
+  /**
+   * 고른 구간을 클립 안쪽 시간으로 옮긴다. 타임라인 시간과 클립 버퍼의 시간은
+   * 클립 시작 오프셋만큼 어긋나 있어서, 그대로 넘기면 엉뚱한 데가 잘린다.
+   */
+  const clipRegion = useMemo(() => {
+    if (!selection || !editTargetClip) return null;
+    const s = Math.max(0, selection.start - editTargetClip.startSec);
+    const e = Math.min(editTargetClip.buffer.duration, selection.end - editTargetClip.startSec);
+    return e > s ? { start: s, end: e } : null;
+  }, [selection, editTargetClip]);
+
+  /** 편집 연산이 볼 구간. 클립이 있으면 클립 안쪽 좌표, 없으면 옛 wavesurfer 구간. */
+  const editRegion: { start: number; end: number } | null =
+    comp.clips.length > 0 ? clipRegion : (activeRegion ? { start: activeRegion.start, end: activeRegion.end } : null);
+
+  /*
+   * 트랙이 바뀔 때마다 피크를 다시 잰다. 원본 Veo 클립은 -20 dBFS 언저리로
+   * 오는 일이 흔한데, 값이 화면에 없으면 규격(-3 dBFS)에 맞는지를 내보내
+   * 재 보기 전까지 알 수가 없다.
+   */
+  useEffect(() => {
+    // 클립이 문서이므로 피크도 지금 들리는 믹스에서 잰다.
+    if (comp.clips.length > 0) {
+      setCurrentPeak(playback.mix ? peakOf(playback.mix) : null);
+      return;
+    }
+    if (!audio.currentUrl) { setCurrentPeak(null); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const arrayBuffer = await (await fetch(audio.currentUrl!)).arrayBuffer();
+        const ctx = makeContext();
+        const buffer = await ctx.decodeAudioData(arrayBuffer);
+        void ctx.close();
+        if (!cancelled) setCurrentPeak(peakOf(buffer));
+      } catch {
+        if (!cancelled) setCurrentPeak(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [audio.currentUrl, comp.clips.length, playback.mix]);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const wavesurferRef = useRef<WaveSurfer | null>(null);
@@ -175,11 +390,21 @@ const App: React.FC = () => {
       cursorColor: '#ffffff',
       barWidth: 2,
       barGap: 1,
-      height: 300,
+      /*
+        `splitChannels` 를 켜면 이 값이 **채널마다** 걸린다 — 300 이면 스테레오가
+        600 px 이 되어, 보조 화면인 `합친 결과` 가 정작 편집면인 트랙보다 커진다.
+        지금은 마디 격자용 확인 화면이므로 그만큼만 준다.
+      */
+      height: 96,
       normalize: true,
-      splitChannels: (!audio.isMono) as any,
+      /*
+        좌우를 나눠 그리지 않는다. 채널을 살펴보는 자리는 이제 트랙별 파형이고,
+        여기는 마디 격자용 구간을 끄는 자리다 — 같은 것을 두 번 보여 줄 이유가 없고,
+        나누면 높이가 채널 수만큼 곱해져 보조 화면이 또 커진다.
+      */
+      splitChannels: false as any,
       url: audio.currentUrl,
-      minPxPerSec: zoom,
+      minPxPerSec: Math.max(1, zoomFactor * 40),
       autoScroll: true,
       hideScrollbar: false,
     });
@@ -227,7 +452,9 @@ const App: React.FC = () => {
     return () => {
       ws.destroy();
     };
-  }, [audio.currentUrl, audio.isMono]);
+    // 좌우를 안 나누게 된 뒤로 `isMono` 는 이 화면에 영향이 없다 — 넣어 두면
+    // 모노로 바꿀 때마다 파형을 쓸데없이 다시 만든다.
+  }, [audio.currentUrl]);
 
   /**
    * 오디오든 영상이든 받아서 48 kHz PCM WAV 로 바꿔 놓고 시작한다.
@@ -236,64 +463,24 @@ const App: React.FC = () => {
    * ffmpeg 이 필요 없다. 임포트에서 레이트를 못 박아 두면 이후 모든 편집과 내보내기가
    * 48 kHz 로 유지된다 — 원래는 출력 장치 레이트를 따라가서 44.1 kHz 가 조용히 섞였다.
    */
-  const handleFileUpload = async (file: File) => {
-    if (!file) return;
-    const isMedia = file.type.startsWith('audio/') || file.type.startsWith('video/');
-    if (!isMedia) {
-      alert(`오디오나 영상 파일이 아닙니다: ${file.type || '알 수 없는 형식'}`);
+  /*
+   * 되돌리기는 클립이 문서가 된 뒤로 두 갈래다. 트랙에 클립이 있으면 클립
+   * 스냅샷을 되돌리고, 아직 트랙이 없을 때만 옛 합친-WAV 스택을 쓴다.
+   * 편집이 클립에 걸리는데 되돌리기가 합친 파일만 보고 있으면 되돌 방법이 없다.
+   */
+  const handleUndo = () => {
+    if (comp.undo.length > 0) {
+      setComp(prev => {
+        if (prev.undo.length === 0) return prev;
+        const undo = [...prev.undo];
+        const restored = undo.pop()!;
+        return { ...prev, clips: restored, undo, redo: [prev.clips, ...prev.redo].slice(0, 30) };
+      });
+      setSelection(null);
       return;
     }
-
-    if (audio.originalUrl) URL.revokeObjectURL(audio.originalUrl);
-    audio.undoStack.forEach(url => url !== audio.originalUrl && URL.revokeObjectURL(url));
-    audio.redoStack.forEach(url => URL.revokeObjectURL(url));
-
-    setAudio(prev => ({
-      ...prev,
-      isProcessing: true,
-      processingMsg: file.type.startsWith('video/')
-        ? '영상에서 오디오 트랙 추출 중…'
-        : '48 kHz 로 디코드 중…',
-    }));
-
-    try {
-      const { blob, info } = await decodeFileToWav(file, PROJECT_SAMPLE_RATE);
-      const url = URL.createObjectURL(blob);
-      setAudio({
-        file,
-        originalUrl: url,
-        currentUrl: url,
-        duration: info.duration,
-        currentTime: 0,
-        isPlaying: false,
-        isReady: false,
-        isMono: info.channels === 1,
-        isProcessing: false,
-        processingMsg: '',
-        noiseProfile: null,
-        volume: 1.0,
-        undoStack: [],
-        redoStack: [],
-        gateThreshold: 0.01,
-        showGateSettings: false,
-        gainMultiplier: 1.0,
-        showGainSettings: false,
-        sourceKind: info.sourceKind,
-        channels: info.channels,
-      });
-      setActiveRegion(null);
-      setShowChannelSettings(false);
-      loopPlaybackRef.current = { active: false, start: 0, end: 0 };
-      setLoop(prev => ({ ...prev, previewLooping: false, downbeat: 0 }));
-    } catch (e: any) {
-      setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
-      alert(`디코드할 수 없습니다: ${e?.message ?? e}\n\n브라우저가 못 여는 코덱이면 이 파일만 ffmpeg 으로 wav 를 뽑아 주십시오.`);
-    }
-  };
-
-  const handleUndo = () => {
     if (audio.undoStack.length === 0 || !audio.currentUrl) return;
-    
+
     const newUndoStack = [...audio.undoStack];
     const previousUrl = newUndoStack.pop()!;
     const currentUrl = audio.currentUrl;
@@ -310,6 +497,16 @@ const App: React.FC = () => {
   };
 
   const handleRedo = () => {
+    if (comp.redo.length > 0) {
+      setComp(prev => {
+        if (prev.redo.length === 0) return prev;
+        const redo = [...prev.redo];
+        const restored = redo.shift()!;
+        return { ...prev, clips: restored, redo, undo: [...prev.undo, prev.clips].slice(-30) };
+      });
+      setSelection(null);
+      return;
+    }
     if (audio.redoStack.length === 0 || !audio.currentUrl) return;
 
     const newRedoStack = [...audio.redoStack];
@@ -327,29 +524,105 @@ const App: React.FC = () => {
     setActiveRegion(null);
   };
 
+  /**
+   * 처음부터 다시. `트랙 추가` 가 더하기만 하게 된 뒤로 **여기가 유일한 되돌아갈
+   * 자리**라, 편집뿐 아니라 쌓아 둔 트랙까지 함께 비운다.
+   */
   const handleRevert = () => {
-    if (!audio.originalUrl || !confirm("Discard all edits and revert to original source?")) return;
-    
-    const currentUrl = audio.currentUrl;
-    
+    if (comp.clips.length === 0 && !audio.currentUrl) return;
+    if (!confirm('쌓아 둔 트랙과 편집을 모두 버리고 빈 상태로 돌아갑니다. 되돌리기 기록도 지워집니다. 계속할까요?')) return;
+
+    /*
+     * 예전에는 "합친 결과를 처음 것으로 되돌리기"였는데, 그러면 클립은 0 인데
+     * 합친 화면에는 옛 오디오가 남는 **반쪽 상태**가 됐다. 되돌리기 스택도 그대로
+     * 남아서 몇 번 누르면 지운 줄 알았던 클립이 되살아났다.
+     *
+     * `트랙 추가` 가 더하기만 하게 된 뒤로 여기가 유일하게 처음으로 가는 문이므로,
+     * 정말로 빈 상태까지 간다 — 문서(클립)·기록·화면·이름을 한꺼번에 비운다.
+     */
+    for (const url of new Set([audio.originalUrl, audio.currentUrl, ...audio.undoStack, ...audio.redoStack])) {
+      if (url) URL.revokeObjectURL(url);
+    }
+
+    setComp(prev => ({
+      ...prev,
+      clips: [], clipboard: null, lastPeak: null, minLanes: 0,
+      undo: [], redo: [],
+    }));
     setAudio(prev => ({
       ...prev,
-      currentUrl: prev.originalUrl,
-      isMono: false,
-      noiseProfile: null,
-      isProcessing: false,
-      processingMsg: '',
-      undoStack: currentUrl ? [...prev.undoStack, currentUrl] : prev.undoStack,
-      redoStack: [],
-      showGateSettings: false,
-      showGainSettings: false
+      file: null, originalUrl: null, currentUrl: null,
+      duration: 0, currentTime: 0,
+      isPlaying: false, isReady: false, isMono: false,
+      isProcessing: false, processingMsg: '',
+      undoStack: [], redoStack: [],
+      sourceKind: null, channels: 0,
     }));
+    setSelection(null);
+    setSelectedClipId(null);
+    setExportName('');
+    setZoomFactor(1);
     setActiveRegion(null);
-    setShowChannelSettings(false);
     regionsRef.current?.clearRegions();
   };
 
-  const performProcessing = async (msg: string, processor: (buffer: AudioBuffer, ctx: AudioContext) => AudioBuffer | null | Promise<AudioBuffer | null>) => {
+  /**
+   * `target: 'merged'` 는 **합친 결과 트랙**에 걸라는 뜻이다.
+   *
+   * Loop Lab 이 그렇다 — 구간을 wavesurfer(합친 트랙)에서 받으므로 시간이 합친
+   * 트랙 기준인데, 클립이 있다고 클립 버퍼에 그 시간을 그대로 들이대면
+   * **엉뚱한 자리가 잘린다.** 좌표계가 다른 값을 섞지 않으려는 것이다.
+   */
+  const performProcessing = async (
+    msg: string,
+    processor: (buffer: AudioBuffer, ctx: AudioContext) => AudioBuffer | null | Promise<AudioBuffer | null>,
+    opts: { target?: 'clip' | 'merged' } = {}
+  ) => {
+    /*
+     * 클립이 문서다 — 트랙이 있으면 편집은 고른 클립의 버퍼에 건다.
+     * 연산은 전부 `(buffer, ctx) => buffer` 라서 대상만 바꾸면 그대로 쓸 수 있다.
+     *
+     * 반드시 **복사본**에 건다. applyGain·applyFade 는 버퍼를 제자리에서 고치므로
+     * 원본에 걸면 되돌리기가 남을 것이 없고, 재생 중인 믹스도 함께 바뀐다.
+     */
+    if (comp.clips.length > 0 && opts.target !== 'merged') {
+      const clip = editTargetClip;
+      if (!clip) {
+        alert('편집할 클립을 고르십시오 — 트랙에서 클립을 누르거나 구간을 그으면 됩니다.');
+        return;
+      }
+      setAudio(prev => ({ ...prev, isProcessing: true, processingMsg: msg }));
+      try {
+        const ctx = makeContext();
+        const copy = ctx.createBuffer(clip.buffer.numberOfChannels, clip.buffer.length, clip.buffer.sampleRate);
+        for (let c = 0; c < clip.buffer.numberOfChannels; c++) {
+          copy.getChannelData(c).set(clip.buffer.getChannelData(c));
+        }
+        const next = await processor(copy, ctx);
+        void ctx.close();
+        if (next) {
+          setComp(prev => ({
+            ...prev,
+            undo: [...prev.undo, prev.clips].slice(-30),
+            redo: [],
+            clips: prev.clips.map(c => (c.id === clip.id ? { ...c, buffer: next } : c)),
+          }));
+          /*
+           * 편집이 끝나면 구간을 놓는다. 자르고 나면 클립 길이가 달라져서 남아
+           * 있는 사각형이 더 이상 그 자리를 가리키지 않는다 — 그대로 두면
+           * 다음 편집이 엉뚱한 데 걸린다. 고른 클립은 남겨서 이어 손볼 수 있게 한다
+           * (구간을 그을 때 `handleSelectionChange` 가 대상 클립을 기억해 둔다).
+           */
+          setSelection(null);
+          setSelectedClipId(clip.id);
+        }
+      } catch (e) {
+        console.error('Clip processing failed', e);
+      }
+      setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
+      return;
+    }
+
     if (!audio.currentUrl) return;
     setAudio(prev => ({ ...prev, isProcessing: true, processingMsg: msg }));
     
@@ -376,12 +649,9 @@ const App: React.FC = () => {
         processingMsg: '',
         isMono: newBuffer.numberOfChannels === 1,
         undoStack: [...prev.undoStack, oldUrl],
-        redoStack: [],
-        showGateSettings: false,
-        showGainSettings: false
+        redoStack: []
       }));
       setActiveRegion(null);
-      setShowChannelSettings(false);
     } catch (error) {
       console.error("Processing failed", error);
       setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
@@ -389,52 +659,9 @@ const App: React.FC = () => {
   };
 
   const handleFadeAction = (type: 'in' | 'out') => {
-    if (!activeRegion) return;
-    performProcessing(`Fading ${type}...`, (buffer) => 
-      applyFade(buffer, activeRegion.start, activeRegion.end, type)
-    );
-  };
-
-  const handleAnalyzeNoiseAction = async () => {
-    if (!activeRegion || !audio.currentUrl) return;
-    setAudio(prev => ({ ...prev, isProcessing: true, processingMsg: 'Sampling Noise Fingerprint...' }));
-
-    try {
-      const response = await fetch(audio.currentUrl);
-      const arrayBuffer = await response.arrayBuffer();
-      const audioCtx = makeContext(); // 48 kHz 고정 — 장치 레이트를 따라가면 조용히 리샘플링된다
-      const buffer = await audioCtx.decodeAudioData(arrayBuffer);
-      
-      const profile = analyzeNoiseProfile(buffer, activeRegion.start, activeRegion.end);
-
-      setAudio(prev => ({
-        ...prev,
-        noiseProfile: profile,
-        isProcessing: false,
-        processingMsg: ''
-      }));
-    } catch (error) {
-      console.error("Analysis failed", error);
-      setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
-    }
-  };
-
-  const handleCleanAtmosphereAction = () => {
-    if (!audio.noiseProfile) return;
-    performProcessing('Spectral Subtraction...', (buffer) => 
-      applySpectralSubtraction(buffer, audio.noiseProfile!)
-    );
-  };
-
-  const handleNormalizeAction = () => {
-    performProcessing('Normalizing Peaks...', applyNormalization);
-  };
-
-  const handleGainAction = () => {
-    const isSelection = !!activeRegion;
-    const msg = isSelection ? `Amplifying Selection (${audio.gainMultiplier}x)...` : `Amplifying Full Track (${audio.gainMultiplier}x)...`;
-    performProcessing(msg, (buffer) => 
-      applyGain(buffer, audio.gainMultiplier, activeRegion?.start, activeRegion?.end)
+    if (!editRegion) return;
+    performProcessing(`Fading ${type}...`, (buffer) =>
+      applyFade(buffer, editRegion.start, editRegion.end, type)
     );
   };
 
@@ -445,16 +672,16 @@ const App: React.FC = () => {
   };
 
   const handleCutAction = () => {
-    if (!activeRegion) return;
-    performProcessing('Destructive Cut...', (buffer, ctx) => 
-      applyCut(buffer, activeRegion.start, activeRegion.end, ctx)
+    if (!editRegion) return;
+    performProcessing('Destructive Cut...', (buffer, ctx) =>
+      applyCut(buffer, editRegion.start, editRegion.end, ctx)
     );
   };
 
   const handleCropAction = () => {
-    if (!activeRegion) return;
-    performProcessing('Cropping Selection...', (buffer, ctx) => 
-      applyCrop(buffer, activeRegion.start, activeRegion.end, ctx)
+    if (!editRegion) return;
+    performProcessing('Cropping Selection...', (buffer, ctx) =>
+      applyCrop(buffer, editRegion.start, editRegion.end, ctx)
     );
   };
 
@@ -478,7 +705,19 @@ const App: React.FC = () => {
   };
 
   /** 현재 선택의 양 끝을 가장 가까운 마디선으로 당긴다. */
+  /*
+   * 마디 격자도 트랙에서 논다. 클립이 있으면 구간을 **트랙 선택**으로 잡고,
+   * 트랙이 없을 때만 옛 wavesurfer 구간을 쓴다. 두 좌표계를 섞지 않으려는 것이다.
+   */
   const handleSnapRegion = () => {
+    if (comp.clips.length > 0) {
+      if (!selection) return;
+      const s = snapToBar(selection.start, loop.bpm, loop.beatsPerBar, loop.downbeat);
+      const e0 = snapToBar(selection.end, loop.bpm, loop.beatsPerBar, loop.downbeat);
+      const e = e0 === s ? s + barSeconds(loop.bpm, loop.beatsPerBar) : e0;
+      handleSelectionChange({ lane: selection.lane, start: s, end: e });
+      return;
+    }
     if (!activeRegion) return;
     const s = snapToBar(activeRegion.start, loop.bpm, loop.beatsPerBar, loop.downbeat);
     const e = snapToBar(activeRegion.end, loop.bpm, loop.beatsPerBar, loop.downbeat);
@@ -487,11 +726,22 @@ const App: React.FC = () => {
 
   /** 선택 시작(없으면 다운비트)에서 N 마디를 잡는다. */
   const handleSelectBars = () => {
+    const span = loop.bars * barSeconds(loop.bpm, loop.beatsPerBar);
+    if (comp.clips.length > 0) {
+      // 고른 클립이 있으면 그 트랙에, 없으면 재생 헤드가 놓인 트랙 0 에 잡는다.
+      const lane = selection?.lane ?? comp.clips.find(c => c.id === selectedClipId)?.lane ?? 0;
+      const rawStart = selection ? selection.start : playback.currentTime;
+      const start = loop.snapEnabled
+        ? snapToBar(rawStart, loop.bpm, loop.beatsPerBar, loop.downbeat)
+        : rawStart;
+      handleSelectionChange({ lane, start, end: start + span });
+      return;
+    }
     const rawStart = activeRegion ? activeRegion.start : loop.downbeat;
     const start = loop.snapEnabled
       ? snapToBar(rawStart, loop.bpm, loop.beatsPerBar, loop.downbeat)
       : rawStart;
-    setRegionExact(start, start + loop.bars * barSeconds(loop.bpm, loop.beatsPerBar));
+    setRegionExact(start, start + span);
   };
 
   /** 재생 위치를 첫 다운비트로 삼는다. 첫 박이 0 이 아닌 곡에 필요하다. */
@@ -500,6 +750,20 @@ const App: React.FC = () => {
   };
 
   const toggleLoopPreview = () => {
+    if (comp.clips.length > 0) {
+      // 트랙에서는 재생 엔진이 구간을 되풀이한다 — 표본 단위로 브라우저가 이어 준다.
+      const next = !loop.previewLooping;
+      if (next && selection && selection.end > selection.start) {
+        playback.setLoopRange({ start: selection.start, end: selection.end });
+        playback.seek(selection.start);
+        playback.play();
+      } else {
+        playback.setLoopRange(null);
+        playback.pause();
+      }
+      setLoop(prev => ({ ...prev, previewLooping: next && !!selection }));
+      return;
+    }
     if (!activeRegion) return;
     const next = !loop.previewLooping;
     loopPlaybackRef.current = next
@@ -515,15 +779,496 @@ const App: React.FC = () => {
 
   /** 선택을 루프로 확정한다. 뒤쪽 foldMs 를 앞머리에 접어 이음매를 잇는다. */
   const handleMakeLoopAction = () => {
-    if (!activeRegion) return;
-    const bars = barsBetween(activeRegion.start, activeRegion.end, loop.bpm, loop.beatsPerBar);
+    const region = editRegion;
+    if (!region) return;
+    const bars = barsBetween(region.start, region.end, loop.bpm, loop.beatsPerBar);
     const off = Math.abs(bars - Math.round(bars));
     if (off > 0.01 && !confirm(
       `선택이 ${bars.toFixed(3)} 마디입니다 — 마디 경계에 안 맞습니다.\n` +
       `이대로 자르면 루프가 돌 때 박자가 어긋납니다. 계속할까요?`
     )) return;
+    /*
+      구간을 받은 곳과 자르는 곳의 좌표계를 맞춘다 — 트랙에서 골랐으면 클립을,
+      합친 트랙에서 골랐으면 합친 트랙을 자른다. 섞으면 엉뚱한 자리가 잘린다.
+    */
     performProcessing(`루프 제작 (${Math.round(bars)}마디, 꼬리 ${loop.foldMs} ms)…`, (buffer, ctx) =>
-      makeSeamlessLoop(buffer, activeRegion.start, activeRegion.end, loop.foldMs, ctx)
+      makeSeamlessLoop(buffer, region.start, region.end, loop.foldMs, ctx),
+      { target: comp.clips.length > 0 ? 'clip' : 'merged' }
+    );
+  };
+
+  // --- 병합 작업대 ---
+
+  const newClipId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  /**
+   * 클립을 담는다. 기본 배치는 "같은 레인 뒤에 이어 붙이기"다 — 앞 클립 끝에서
+   * 크로스페이드만큼 당겨 겹치고, 마주 보는 두 클립에 등출력 페이드를 물린다.
+   * 겹쳐 쌓고 싶으면 담은 뒤 "겹치기"로 레인을 옮긴다.
+   *
+   * `bake` 는 아직 편집 중인 트랙이 없을 때 쓴다 — 클립 여러 개로 처음부터
+   * 시작하는 경우, 담자마자 한 번 구워 줘야 편집기가 열린다.
+   */
+  /** 지금 편집 중인 트랙을 클립 하나로 만든다. 없으면 null. */
+  const currentTrackAsClip = async (): Promise<{ id: string; name: string; buffer: AudioBuffer } | null> => {
+    if (!audio.currentUrl) return null;
+    const arrayBuffer = await (await fetch(audio.currentUrl)).arrayBuffer();
+    const ctx = makeContext();
+    const buffer = await ctx.decodeAudioData(arrayBuffer);
+    void ctx.close();
+    return { id: newClipId(), name: audio.file?.name ?? 'current.wav', buffer };
+  };
+
+  const handleComposerImport = async (files: FileList | null, bake = false) => {
+    if (!files || files.length === 0) return;
+    setAudio(prev => ({ ...prev, isProcessing: true, processingMsg: '클립 디코드 중…' }));
+    try {
+      const decoded: { id: string; name: string; buffer: AudioBuffer }[] = [];
+      for (const file of Array.from(files)) {
+        // Veo mp4 도 그대로 놓으면 된다 — 브라우저가 오디오 트랙만 디코드한다.
+        decoded.push({ id: newClipId(), name: file.name, buffer: await decodeFileToBuffer(file, PROJECT_SAMPLE_RATE) });
+      }
+
+      /*
+       * 담긴 클립이 없을 때 편집 중인 트랙을 자동으로 클립 0 으로 넣던 것을 뺐다.
+       *
+       * `IMPORT` 가 클립 없이 트랙만 열던 시절에는 필요했지만, `트랙 추가` 로 바뀐 뒤로
+       * **합친 트랙은 클립에서만 나온다.** 그래서 "클립은 비었는데 합친 트랙은 있다"는
+       * 상태는 **사용자가 트랙을 다 지웠을 때뿐**이고, 거기서 자동으로 넣으면
+       * 지운 것이 되살아난다. 실제로 그렇게 됐다 — 다 지우고 파일 하나를 더했더니
+       * 클립이 2개가 됐다.
+       */
+      const next = placeClips(comp.clips, decoded, 0, comp.crossfadeMs);
+      commitClips(next);
+      setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
+      // 아무것도 없던 상태에서 클립으로 시작했으면 첫 클립 이름을 제안으로 쓴다.
+      if (!audio.currentUrl && decoded[0]) setExportName(suggestAssetName(decoded[0].name));
+      if (bake) await bakeComposition(next);
+    } catch (e: any) {
+      setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
+      alert(`디코드할 수 없습니다: ${e?.message ?? e}\n\n브라우저가 못 여는 코덱이면 이 파일만 ffmpeg 으로 wav 를 뽑아 주십시오.`);
+    }
+  };
+
+  /** 지금 편집 중인 트랙을 클립으로 담는다. 편집한 결과 위에 더 얹을 때 쓴다. */
+  const handleAddCurrentAsClip = async () => {
+    if (!audio.currentUrl) return;
+    setAudio(prev => ({ ...prev, isProcessing: true, processingMsg: '현재 트랙을 클립으로…' }));
+    try {
+      const cur = await currentTrackAsClip();
+      if (cur) {
+        const next = placeClips(comp.clips, [cur], 0, comp.crossfadeMs);
+        commitClips(next);
+      }
+      setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
+    } catch (e) {
+      console.error(e);
+      setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
+    }
+  };
+
+  /**
+   * 되돌리기 스냅샷을 한 장 쌓는다.
+   *
+   * **편집 동작이 시작될 때 한 번만** 부른다 — 끄는 동안 매 프레임 쌓으면
+   * 되돌리기 한 번에 1 픽셀씩 돌아가서 쓸모가 없어진다. 그래서 드래그는
+   * 시작 시점에, 숫자 칸은 포커스가 들어올 때 한 장씩 쌓는다.
+   *
+   * 버퍼는 참조로 공유하므로 스냅샷은 배열 하나 값이다.
+   */
+  const pushUndo = useCallback(() => {
+    setComp(prev => ({ ...prev, undo: [...prev.undo, prev.clips].slice(-30), redo: [] }));
+  }, []);
+
+  /** 스냅샷을 쌓고 클립을 갈아 끼운다. 한 번에 끝나는 동작(삭제·붙여넣기 등)용. */
+  const commitClips = useCallback((next: CompClip[]) => {
+    setComp(prev => ({ ...prev, undo: [...prev.undo, prev.clips].slice(-30), redo: [], clips: next }));
+  }, []);
+
+  /** 값만 바꾼다. 스냅샷은 동작 시작 때 `pushUndo` 가 이미 쌓아 뒀다 (드래그가 이쪽). */
+  const updateClip = (id: string, patch: Partial<CompClip>) => {
+    setComp(prev => ({ ...prev, clips: prev.clips.map(c => (c.id === id ? { ...c, ...patch } : c)) }));
+  };
+
+  /** 마지막으로 손댄 칸과 시각. 연속으로 고친 것을 한 번에 되돌리려고 기억한다. */
+  const lastFieldEditRef = useRef<{ key: string; at: number }>({ key: '', at: 0 });
+
+  /**
+   * 숫자 칸에서 값을 고친다. 스냅샷은 **한 벌의 편집마다 한 장**만 쌓는다.
+   *
+   * 원래 `onFocus` 로 쌓았는데, 포커스 이벤트는 창이 활성이 아니면 아예 안 뜬다 —
+   * 그러면 스냅샷이 빠진 채 값만 바뀌고, 되돌리기가 엉뚱하게 그 이전 상태로
+   * 건너뛴다. 이벤트에 기대지 않고 "같은 칸을 0.8초 안에 계속 고치는 중이면
+   * 같은 편집"으로 묶는다.
+   */
+  const updateClipField = (id: string, patch: Partial<CompClip>) => {
+    const key = `${id}:${Object.keys(patch).join(',')}`;
+    const now = Date.now();
+    const isNewGesture = lastFieldEditRef.current.key !== key || now - lastFieldEditRef.current.at > 800;
+    lastFieldEditRef.current = { key, at: now };
+
+    setComp(prev => ({
+      ...prev,
+      ...(isNewGesture ? { undo: [...prev.undo, prev.clips].slice(-30), redo: [] } : {}),
+      clips: prev.clips.map(c => (c.id === id ? { ...c, ...patch } : c)),
+    }));
+  };
+
+  const removeClip = (id: string) => {
+    commitClips(comp.clips.filter(c => c.id !== id));
+  };
+
+  /**
+   * 무음을 클립으로 담는다 — 이것이 결과 길이를 늘리는 방법이다.
+   * 길이는 "가장 늦게 끝나는 클립"이 정하므로, 뒤에 무음을 붙이면 그만큼 늘어난다.
+   *
+   * 무음은 **반드시 모노**로 만든다. 결과 채널 수가 클립 중 최대치라서,
+   * 스테레오 무음을 담으면 모노 자산(효과음·말 상태음)이 조용히 스테레오로
+   * 승격돼 규격을 어기게 된다. 모노는 최솟값이라 아무것도 바꾸지 않는다.
+   */
+  const handleAddSilence = () => {
+    const sec = Math.max(0.001, comp.silenceSec);
+    const ctx = makeContext();
+    const buffer = ctx.createBuffer(1, Math.round(sec * PROJECT_SAMPLE_RATE), PROJECT_SAMPLE_RATE);
+    void ctx.close();
+    // 크로스페이드 없이 딱 붙인다 — 무음과 겹쳐 페이드하면 앞 클립이 깎인다.
+    commitClips(placeClips(comp.clips, [{ id: newClipId(), name: `무음 ${sec}초`, buffer }], 0, 0));
+  };
+
+  /**
+   * 트랙을 더한다 — 고른 파일마다 새 트랙을 하나씩 내주고 0 초에 나란히 얹는다.
+   *
+   * 예전 `IMPORT` 는 되돌리기까지 싹 비우고 새로 여는 버튼이었다. 트랙을 쌓아
+   * 쓰는 도구에서 "파일을 연다"가 "지금 것을 버린다"와 같은 뜻인 것은 맞지 않다.
+   * 처음부터 다시 하려면 `RESET` 이 있다.
+   */
+  const handleAddTrack = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+
+    const picked = Array.from(files);
+    const notMedia = picked.find(f => !f.type.startsWith('audio/') && !f.type.startsWith('video/'));
+    if (notMedia) {
+      alert(`오디오나 영상 파일이 아닙니다: ${notMedia.name} (${notMedia.type || '알 수 없는 형식'})`);
+      return;
+    }
+    const anyVideo = picked.some(f => f.type.startsWith('video/'));
+
+    setAudio(prev => ({
+      ...prev,
+      isProcessing: true,
+      processingMsg: anyVideo ? '영상에서 오디오 트랙 추출 중…' : '트랙 추가 중…',
+    }));
+    try {
+      const decoded: { id: string; name: string; buffer: AudioBuffer }[] = [];
+      for (const file of picked) {
+        decoded.push({ id: newClipId(), name: file.name, buffer: await decodeFileToBuffer(file, PROJECT_SAMPLE_RATE) });
+      }
+
+      const hadTrack = !!audio.currentUrl;
+      // 자동 포함은 뺐다 — 위 `handleComposerImport` 의 주석 참고.
+      const next = placeOnNewLanes(comp.clips, decoded);
+      commitClips(next);
+      setAudio(prev => ({
+        ...prev,
+        isProcessing: false,
+        processingMsg: '',
+        // 영상에서 뽑아 온 트랙이 하나라도 있으면 그 표시는 유지한다.
+        sourceKind: anyVideo ? 'video' : prev.sourceKind,
+        file: prev.file ?? picked[0],
+      }));
+
+      if (!hadTrack) {
+        // 아무것도 없던 상태였으면 한 번 구워 줘야 편집기가 열린다.
+        if (decoded[0]) setExportName(suggestAssetName(decoded[0].name));
+        await bakeComposition(next);
+      }
+    } catch (e: any) {
+      setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
+      alert(`디코드할 수 없습니다: ${e?.message ?? e}\n\n브라우저가 못 여는 코덱이면 이 파일만 ffmpeg 으로 wav 를 뽑아 주십시오.`);
+    }
+  };
+
+  // --- 자르고 끼워넣기 ---
+
+  /** 재생 헤드 자리에서 클립을 둘로 쪼갠다. 끼워넣기의 출발점이다. */
+  const handleSplitAtPlayhead = () => {
+    const at = playback.currentTime;
+    const clip = comp.clips.find(c =>
+      c.id === selectedClipId && c.startSec < at && clipEndSec(c) > at
+    ) ?? comp.clips.find(c => c.startSec < at && clipEndSec(c) > at);
+    if (!clip) {
+      alert('재생 헤드가 클립 위에 있어야 쪼갤 수 있습니다.\n눈금을 눌러 헤드를 옮기십시오.');
+      return;
+    }
+    const ctx = makeContext();
+    const next = splitClipAt(
+      comp.clips, clip.id, at,
+      (buffer, from, to) => applyCrop(buffer, from, to, ctx),
+      newClipId
+    );
+    void ctx.close();
+    if (next !== comp.clips) {
+      commitClips(next);
+      setSelection(null);
+    }
+  };
+
+  /** 재생 헤드 자리에 자리를 벌린다 — 뒤엣것을 통째로 민다. */
+  const handleRippleInsert = () => {
+    const lane = selection?.lane ?? comp.clips.find(c => c.id === selectedClipId)?.lane ?? 0;
+    commitClips(rippleInsert(comp.clips, lane, playback.currentTime, comp.silenceSec));
+  };
+
+  /** 고른 클립을 빼고 그 트랙의 틈을 닫는다. */
+  const handleRippleDelete = () => {
+    const clip = comp.clips.find(c => c.id === selectedClipId);
+    if (!clip) {
+      alert('뺄 클립을 먼저 고르십시오.');
+      return;
+    }
+    commitClips(rippleDelete(comp.clips, clip.id));
+    setSelection(null);
+  };
+
+  /**
+   * 고른 **구간**을 새 클립으로 떠서 클립보드에 담는다.
+   *
+   * 클립 통째로 복사하는 것과는 다른 일이다 — 자르고 끼워넣는 흐름에서는
+   * "여기서 여기까지"를 떠다 다른 자리에 놓고 싶지, 클립 전체가 필요한 게 아니다.
+   */
+  /** 고른 구간을 떠서 클립보드에 담는다. 복사와 잘라내기가 같은 것을 담아야 하므로 한 곳에 둔다. */
+  const putRegionOnClipboard = (): boolean => {
+    if (!editTargetClip || !clipRegion) return false;
+    const ctx = makeContext();
+    const piece = applyCrop(editTargetClip.buffer, clipRegion.start, clipRegion.end, ctx);
+    void ctx.close();
+    if (!piece) return false;
+    setComp(prev => ({
+      ...prev,
+      clipboard: {
+        ...editTargetClip,
+        id: newClipId(),
+        name: `${baseClipName(editTargetClip.name)} (조각)`,
+        buffer: piece,
+        startSec: 0,
+        fadeInMs: 0,
+        fadeOutMs: 0,
+      },
+    }));
+    return true;
+  };
+
+  const handleCopyRange = () => {
+    if (!putRegionOnClipboard()) {
+      alert('먼저 트랙에서 구간을 그으십시오 — “구간 선택” 모드로 끌면 됩니다.');
+    }
+  };
+
+  /**
+   * 잘라내기 = 담고 나서 그 자리를 지운다.
+   *
+   * 구간을 골랐으면 그 구간을 떠서 담고 클립에서 도려낸다(뒤가 당겨와 틈이 안 남는다).
+   * 구간이 없으면 **고른 클립 통째**를 담고 트랙에서 뺀다 — 이때는 자리를 그대로 두고
+   * 빼기만 한다. 뒤엣것까지 당기는 것은 `틈 닫기` 의 몫이라, 한 단추가 두 일을 하면 안 된다.
+   */
+  const handleCutRange = () => {
+    if (clipRegion && editTargetClip) {
+      if (!putRegionOnClipboard()) return;
+      performProcessing('구간 잘라내기…', (buffer, ctx) =>
+        applyCut(buffer, clipRegion.start, clipRegion.end, ctx)
+      );
+      return;
+    }
+    const clip = comp.clips.find(c => c.id === selectedClipId);
+    if (!clip) {
+      alert('먼저 구간을 긋거나 클립을 고르십시오.');
+      return;
+    }
+    setComp(prev => ({ ...prev, clipboard: { ...clip, id: newClipId(), startSec: 0 } }));
+    commitClips(comp.clips.filter(c => c.id !== clip.id));
+    setSelection(null);
+  };
+
+  /** 클립보드를 **재생 헤드 자리**에 붙여넣는다. 트랙은 고른 트랙을 따른다. */
+  const handlePasteAtPlayhead = () => {
+    if (!comp.clipboard) return;
+    const lane = selection?.lane ?? comp.clips.find(c => c.id === selectedClipId)?.lane ?? 0;
+    const base = baseClipName(comp.clipboard.name);
+    const n = comp.clips.filter(c => baseClipName(c.name) === base).length;
+    commitClips([...comp.clips, {
+      ...comp.clipboard,
+      id: newClipId(),
+      lane,
+      startSec: Math.round(playback.currentTime * 1e4) / 1e4,
+      name: `${base} (붙임 ${n})`,
+    }]);
+  };
+
+  /*
+   * 단축키. 늘 최신 상태를 보도록 ref 에 담아 두고 리스너는 한 번만 건다 —
+   * 핸들러를 그대로 걸면 렌더마다 새로 만들어져 매번 다시 등록된다.
+   */
+  const shortcutRef = useRef<(e: KeyboardEvent) => void>(() => {});
+  shortcutRef.current = (e: KeyboardEvent) => {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+
+    /*
+     * 글자를 치는 중이면 손대지 않는다. 이름 칸에서 Ctrl+C 가 막히면
+     * 이름을 복사할 방법이 없어진다 — 브라우저 몫으로 넘긴다.
+     */
+    const t = e.target as HTMLElement | null;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    if (comp.clips.length === 0) return;
+
+    const key = e.key.toLowerCase();
+    if (key === 'c') {
+      // 구간을 그었으면 그 조각을, 아니면 고른 클립을 통째로 담는다.
+      if (clipRegion) { e.preventDefault(); handleCopyRange(); }
+      else if (selectedClipId) { e.preventDefault(); copyClip(selectedClipId); }
+    } else if (key === 'x') {
+      if (clipRegion || selectedClipId) { e.preventDefault(); handleCutRange(); }
+    } else if (key === 'v') {
+      if (comp.clipboard) { e.preventDefault(); handlePasteAtPlayhead(); }
+    }
+  };
+
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => shortcutRef.current(e);
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, []);
+
+  /** 붙여넣을 때 이름이 "(복사) (복사)" 로 겹치지 않게 뿌리 이름을 뽑는다. */
+  /**
+   * 클립 이름의 뿌리. 쪼개고·뜨고·붙이다 보면 꼬리표가 계속 쌓여
+   * `a.wav (뒤) (조각) (붙임 0) (복사 1)` 같은 이름이 된다. 붙일 때마다 걷어 낸다.
+   */
+  const baseClipName = (name: string) =>
+    name.replace(/(?: \((?:복사|붙임)(?: \d+)?\)| \(뒤\)| \(조각\))+$/, '');
+
+  const copyClip = (id: string) => {
+    setComp(prev => {
+      const c = prev.clips.find(x => x.id === id);
+      return c ? { ...prev, clipboard: c } : prev;
+    });
+  };
+
+  /**
+   * 복사해 둔 클립을 새 레인에 붙여넣는다 — 같은 자리에서 겹쳐 울린다.
+   * 여러 번 붙여넣으면 레인이 계속 늘어나므로, 같은 소리를 오프셋만 달리해
+   * 여러 겹 쌓을 수 있다.
+   */
+  const pasteClipToNewLane = () => {
+    if (!comp.clipboard) return;
+    const lanes = comp.clips.map(c => c.lane);
+    const nextLane = lanes.length ? Math.max(...lanes) + 1 : 0;
+    const base = baseClipName(comp.clipboard.name);
+    const n = comp.clips.filter(c => baseClipName(c.name) === base).length;
+    commitClips([...comp.clips, {
+      ...comp.clipboard,
+      id: newClipId(),
+      lane: nextLane,
+      name: `${base} (복사 ${n})`,
+    }]);
+  };
+
+  /** 클립을 새 레인으로 옮겨 겹치게 한다 (병렬 배치). */
+  const stackClip = (id: string) => {
+    const lanes = comp.clips.map(c => c.lane);
+    const nextLane = lanes.length ? Math.max(...lanes) + 1 : 0;
+    commitClips(comp.clips.map(c =>
+      c.id === id ? { ...c, lane: nextLane, startSec: 0, fadeInMs: 0, fadeOutMs: 0 } : c
+    ));
+  };
+
+  /** 전부 합쳐 한 트랙으로 굽고 편집기로 넘긴다. */
+  const bakeComposition = async (clips: CompClip[] = comp.clips) => {
+    if (clips.length === 0) return;
+    setAudio(prev => ({ ...prev, isProcessing: true, processingMsg: '클립 합치는 중…' }));
+    try {
+      const ctx = makeContext();
+      let rendered = renderComposition(clips, ctx, PROJECT_SAMPLE_RATE);
+      if (!rendered) {
+        setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
+        return;
+      }
+      if (comp.wrapMs > 0) {
+        const wrapped = wrapLoopEnds(rendered, comp.wrapMs, ctx);
+        if (wrapped) rendered = wrapped;
+      }
+
+      /*
+       * 합산은 넘칠 수 있다 — 상관 있는 자료가 겹치면 최대 +3 dB 솟는다.
+       * 규격 맞추기를 껐더라도 **넘친 채로 내보내지는 않는다.** 잘라 내는 대신
+       * 0 dBFS 로 눌러 담는다 — 선형 배수만 바뀌므로 소리는 그대로다.
+       */
+      const rawPeak = peakOf(rendered);
+      if (comp.normalizeAfter) rendered = applyNormalizeToDbfs(rendered, loop.targetDbfs);
+      else if (rawPeak > CLIP_CEILING) rendered = applyNormalizeToDbfs(rendered, 0);
+
+      const blob = audioBufferToWav(rendered);
+      const url = URL.createObjectURL(blob);
+      const oldUrl = audio.currentUrl;
+
+      setComp(prev => ({ ...prev, lastPeak: rawPeak }));
+      setAudio(prev => ({
+        ...prev,
+        currentUrl: url,
+        originalUrl: prev.originalUrl ?? url,
+        duration: rendered!.duration,
+        isReady: false,
+        isProcessing: false,
+        processingMsg: '',
+        isMono: rendered!.numberOfChannels === 1,
+        undoStack: oldUrl ? [...prev.undoStack, oldUrl] : prev.undoStack,
+        redoStack: [],
+        file: prev.file ?? new File([blob], 'composed-v1.wav', { type: 'audio/wav' }),
+        channels: rendered!.numberOfChannels,
+        sourceKind: prev.sourceKind ?? 'audio',
+      }));
+      setActiveRegion(null);
+    } catch (e) {
+      console.error('Composition failed', e);
+      setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
+    }
+  };
+
+  /**
+   * 앞뒤로 뒤집는다. 구간을 골랐으면 그 구간만, 아니면 클립 통째로 —
+   * `applyGain` 과 같은 규칙이다. 표본 수도 피크도 그대로라 길이가 흐트러지지 않는다.
+   */
+  const handleReverseAction = () => {
+    performProcessing(
+      editRegion ? '구간 뒤집기…' : '트랙 뒤집기…',
+      (buffer) => applyReverse(buffer, editRegion?.start, editRegion?.end)
+    );
+  };
+
+  /**
+   * 고른 구간(없으면 클립 통째)의 음량을 dB 만큼 올리거나 내린다.
+   *
+   * **넘치면 배수를 깎는다.** 그냥 곱하면 1 을 넘은 표본이 화면에는 남아 있다가
+   * 16-bit 로 쓸 때 잘린다 — 되돌릴 수 없고 소리도 뭉갠다. 깎였으면 얼마나
+   * 걸렸는지 도크에 적어 준다. 말없이 덜 걸리면 그게 더 나쁘다.
+   */
+  const handleGainDbAction = () => {
+    const factor = Math.pow(10, gainDb / 20);
+    performProcessing(
+      `${editRegion ? '구간' : '트랙'} ${gainDb > 0 ? '+' : ''}${gainDb} dB…`,
+      (buffer) => {
+        const r = applyGainCapped(buffer, factor, CLIP_CEILING, editRegion?.start, editRegion?.end);
+        const appliedDb = Math.round(20 * Math.log10(r.applied) * 100) / 100;
+        setGainNotice(
+          !r.capped
+            ? null
+            : appliedDb <= 0.01
+              // 천장에 이미 닿아 있으면 걸린 양이 0 이다. "0 dB 까지만"은
+              // 아무것도 안 걸렸다는 뜻인데 그렇게 안 읽힌다.
+              ? '이미 0 dBFS — 더 못 키운다'
+              : `+${appliedDb} dB 까지만 — 0 dBFS 에 닿았다`
+        );
+        return r.buffer;
+      }
     );
   };
 
@@ -533,35 +1278,53 @@ const App: React.FC = () => {
     );
   };
 
-  const handleExtractChannelAction = (channel: 0 | 1) => {
-    performProcessing(`Extracting ${channel === 0 ? 'Left' : 'Right'} Channel...`, (buffer, ctx) => 
-      applyExtractChannel(buffer, channel, ctx)
-    );
-  };
 
-  const handleSilenceChannelAction = (channel: 0 | 1) => {
-    performProcessing(`Removing ${channel === 0 ? 'Left' : 'Right'} Channel...`, (buffer) => 
-      applySilenceChannel(buffer, channel)
-    );
-  };
 
+  /**
+   * 고른 클립을 모노로 내린다.
+   *
+   * 예전에는 **합친 트랙**(`audio.isMono`)을 보고 "이미 모노"라고 판단했는데, 편집
+   * 대상은 고른 클립이라 둘이 어긋났다 — 모노 트랙에 스테레오를 얹은 상태에서
+   * 그 스테레오 클립을 고르면, 합친 트랙이 아직 모노라 **아무 일도 안 하고 경고만 떴다.**
+   * 이제 고른 클립의 채널 수를 본다.
+   */
   const handleToggleMono = async () => {
-    if (!audio.currentUrl) return;
-    if (!audio.isMono) {
-      performProcessing('Downmixing to Mono...', (buffer, ctx) => mixBufferToMono(buffer, ctx));
-    } else {
-      alert("Note: Returning to stereo after downmix can be done via 'Undo' or 'Reset Project'.");
+    const clip = editTargetClip;
+    if (comp.clips.length > 0 && !clip) {
+      alert('먼저 트랙에서 클립을 고르십시오.');
+      return;
     }
+    performProcessing('모노로 내리는 중…', (buffer, ctx) => mixBufferToMono(buffer, ctx));
   };
 
+  /**
+   * 내보내기는 **지금 들리는 것**을 낸다. 클립이 문서이므로 합치기를 눌러 두지
+   * 않았어도 트랙에서 바로 구워야 하고, 재생과 같은 `renderComposition` 을 쓰므로
+   * 들은 것과 나가는 것이 어긋날 수 없다.
+   */
   const handleDownloadAction = () => {
-    if (!audio.currentUrl) return;
+    let href = audio.currentUrl;
+    if (comp.clips.length > 0 && playback.mix) {
+      const ctx = makeContext();
+      // 정규화(applyGain)는 버퍼를 제자리에서 고친다 — 재생 중인 믹스를 그대로
+      // 넘기면 들리는 소리가 함께 커진다. 반드시 복사본에 건다.
+      let out = ctx.createBuffer(playback.mix.numberOfChannels, playback.mix.length, playback.mix.sampleRate);
+      for (let c = 0; c < playback.mix.numberOfChannels; c++) {
+        out.getChannelData(c).set(playback.mix.getChannelData(c));
+      }
+      // 말아들기는 재생 믹스에 이미 걸려 있다 — 여기서 또 걸면 두 번 말린다.
+      if (comp.normalizeAfter) out = applyNormalizeToDbfs(out, loop.targetDbfs);
+      // 규격 맞추기를 껐어도 넘친 채로는 안 쓴다. 자르지 않고 0 dBFS 로 눌러 담는다.
+      else if (peakOf(out) > CLIP_CEILING) out = applyNormalizeToDbfs(out, 0);
+      void ctx.close();
+      href = URL.createObjectURL(audioBufferToWav(out));
+    }
+    if (!href) return;
     const link = document.createElement('a');
-    link.href = audio.currentUrl;
-    const originalName = audio.file?.name || 'studio_export';
-    const nameWithoutExt = originalName.substring(0, originalName.lastIndexOf('.')) || originalName;
-    // 저장소 관례는 소문자 kebab-case 에 -v1 접미사다. `_edited` 를 붙이면 손으로 다시 고쳐야 한다.
-    link.download = `${nameWithoutExt}.wav`;
+    link.href = href;
+    // 화면의 이름 칸이 진실이다. 비었으면 원본에서 관례대로 지어 준다.
+    const name = exportName.trim() || suggestAssetName(audio.file?.name ?? 'untitled.wav');
+    link.download = `${name}.wav`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -573,32 +1336,45 @@ const App: React.FC = () => {
     wavesurferRef.current?.setVolume(val);
   };
 
+  // 끌어다 놓는 것도 버튼과 같은 뜻이다 — 지금 것을 버리지 않고 트랙으로 더한다.
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
-    const file = e.dataTransfer.files[0];
-    handleFileUpload(file);
-  }, []);
+    void handleAddTrack(e.dataTransfer.files);
+  }, [handleAddTrack]);
 
+  /*
+   * 재생은 트랙을 실시간으로 섞어 들려준다. 합쳐진 파일이 아니라 클립이 문서라서,
+   * 합치기를 누르지 않아도 지금 배치가 그대로 들려야 한다.
+   * 클립이 아직 없을 때만 예전 wavesurfer 재생으로 넘긴다.
+   */
   const togglePlay = () => {
-    if (activeRegion && !audio.isPlaying) {
-      activeRegion.play();
-    } else {
-      wavesurferRef.current?.playPause();
-    }
+    if (comp.clips.length > 0) { playback.toggle(); return; }
+    if (activeRegion && !audio.isPlaying) activeRegion.play();
+    else wavesurferRef.current?.playPause();
   };
-  const playRegion = () => activeRegion?.play();
-  const seekToStart = () => wavesurferRef.current?.setTime(0);
+  const seekToStart = () => {
+    if (comp.clips.length > 0) { playback.seek(0); return; }
+    wavesurferRef.current?.setTime(0);
+  };
   const clearRegion = () => {
     regionsRef.current?.clearRegions();
     setActiveRegion(null);
   };
 
-  const handleZoomChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = parseInt(e.target.value);
-    setZoom(value);
-    wavesurferRef.current?.zoom(value);
-  };
+  /*
+   * 합친 결과 파형도 같은 배율을 따르게 한다. wavesurfer 는 "초당 픽셀"이라
+   * 폭÷길이 로 폭에 맞는 값을 구한 뒤 배율을 곱한다.
+   */
+  useEffect(() => {
+    const ws = wavesurferRef.current;
+    const el = containerRef.current;
+    if (!ws || !el || !audio.isReady) return;
+    const dur = ws.getDuration();
+    if (!dur) return;
+    const fit = Math.max(1, (el.clientWidth - 48) / dur);
+    ws.zoom(fit * zoomFactor);
+  }, [zoomFactor, audio.isReady, audio.currentUrl]);
 
   const formatTime = (time: number) => {
     const minutes = Math.floor(time / 60);
@@ -609,10 +1385,44 @@ const App: React.FC = () => {
 
   // 마디 격자 파생값. 선택이 격자에 맞았는지를 화면에 계속 보여 줘야 손으로 맞출 수 있다.
   const oneBar = barSeconds(loop.bpm, loop.beatsPerBar);
-  const selBars = activeRegion
-    ? barsBetween(activeRegion.start, activeRegion.end, loop.bpm, loop.beatsPerBar)
+  // 판독줄도 지금 고른 구간을 따른다 (트랙이면 트랙 선택, 아니면 합친 트랙 구간).
+  const readoutRegion = comp.clips.length > 0
+    ? (selection && selection.end > selection.start ? { start: selection.start, end: selection.end } : null)
+    : (activeRegion ? { start: activeRegion.start, end: activeRegion.end } : null);
+  const selBars = readoutRegion
+    ? barsBetween(readoutRegion.start, readoutRegion.end, loop.bpm, loop.beatsPerBar)
     : 0;
-  const selOnGrid = !!activeRegion && Math.abs(selBars - Math.round(selBars)) < 0.01;
+  const selOnGrid = !!readoutRegion && Math.abs(selBars - Math.round(selBars)) < 0.01;
+
+  // 병합 파생값. 말아들기는 그만큼 길이를 줄이므로 결과 길이에 미리 반영해 보여 준다.
+  const compChannels = compositionChannels(comp.clips);
+  const compRawSec = compositionLength(comp.clips, PROJECT_SAMPLE_RATE) / PROJECT_SAMPLE_RATE;
+  const compResultSec = Math.max(0, compRawSec - (comp.clips.length > 0 ? comp.wrapMs / 1000 : 0));
+  const compLanes = comp.clips.length ? new Set(comp.clips.map(c => c.lane)).size : 0;
+  /** 실제로 클립이 올라가 있는 트랙 수. 빈 트랙을 뺄 때 이 아래로는 못 내려간다. */
+  const usedLanes = comp.clips.length ? Math.max(...comp.clips.map(c => c.lane)) + 1 : 0;
+
+  /*
+   * 화면에 보이는 시간·재생 상태는 클립이 있으면 트랙 재생을 따른다.
+   * 클립이 문서이므로 그쪽이 진실이고, 합쳐진 파일은 확인용이다.
+   */
+  const composing = comp.clips.length > 0;
+  const playbackTime = composing ? playback.currentTime : audio.currentTime;
+  const playbackDuration = composing ? playback.duration : audio.duration;
+  const isPlayingNow = composing ? playback.isPlaying : audio.isPlaying;
+
+  /**
+   * 컨트롤 묶음. 한 줄에 열 개 넘게 흘려 두면 무엇이 무엇과 한 벌인지 안 보인다.
+   * `accent` 는 패널 색을 따라간다 — Loop Lab 은 emerald, 병합 작업대는 sky.
+   */
+  const group = (label: string, accent: string, children: React.ReactNode) => (
+    <div className="flex flex-col gap-1.5">
+      <span className={`text-[9px] font-black uppercase tracking-widest px-1 ${accent}`}>{label}</span>
+      <div className="flex flex-wrap items-end gap-2 bg-slate-950/40 border border-slate-800/80 rounded-2xl px-3 py-2.5 h-full">
+        {children}
+      </div>
+    </div>
+  );
 
   const numField = (
     label: string,
@@ -631,26 +1441,39 @@ const App: React.FC = () => {
           onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v)) onChange(v); }}
           className={`${opts.width ?? 'w-20'} bg-slate-950 border border-slate-700 rounded-xl px-2 py-1.5 text-sm font-bold text-white focus:border-indigo-500 focus:outline-none`}
         />
-        {opts.suffix && <span className="text-[9px] font-bold text-slate-600 uppercase">{opts.suffix}</span>}
+        {/* 단위는 **대문자로 바꾸지 않는다** — `ms` 가 `MS` 로, `dBFS` 가 `DBFS` 로 찍힌다. */}
+        {opts.suffix && <span className="text-[9px] font-bold text-slate-600">{opts.suffix}</span>}
       </div>
     </label>
   );
 
   return (
     <div 
-      className={`min-h-screen flex flex-col p-8 transition-all duration-500 ${isDragging ? 'bg-indigo-950/40 ring-4 ring-indigo-500 ring-inset' : 'bg-[#0b0f19]'}`}
+      /* 도크가 화면 아래에 붙어 있으므로 그만큼 아래를 비워 둬야 마지막 줄이 안 가린다. */
+      /*
+        도크가 화면 아래에 붙어 있으므로 그 **실제 높이**만큼 아래를 비운다.
+        예전에는 `pb-32`(128 px)로 고정해 뒀는데, 좁은 화면에서 도크가 세 줄로
+        접혀 135 px 이 되면 그만큼이 모자라 아래 내용이 가려졌다.
+      */
+      style={composing ? { paddingBottom: dockHeight + 24 } : undefined}
+      className={`min-h-screen flex flex-col p-6 transition-all duration-500 ${isDragging ? 'bg-indigo-950/40 ring-4 ring-indigo-500 ring-inset' : 'bg-[#0b0f19]'}`}
       onDrop={onDrop}
       onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
       onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
     >
-      <header className="flex justify-between items-center mb-10 bg-slate-900/40 p-4 rounded-2xl border border-slate-800/60 backdrop-blur-xl">
+      <header className="flex justify-between items-center mb-6 bg-slate-900/40 p-3 rounded-2xl border border-slate-800/60 backdrop-blur-xl">
         <div className="flex items-center gap-4">
           <div className="bg-gradient-to-br from-indigo-500 to-purple-600 p-2.5 rounded-xl shadow-[0_0_20px_rgba(99,102,241,0.3)]">
             <AudioWaveform className="w-7 h-7 text-white" />
           </div>
           <div>
             <h1 className="text-2xl font-black tracking-tighter text-white uppercase italic">Pulse<span className="text-indigo-400">Lab</span></h1>
-            <p className="text-[10px] text-slate-500 uppercase tracking-widest font-bold">Spectral Audio Engine v2.4</p>
+            {/*
+              "Spectral Audio Engine" 이었다. 스펙트럴 처리는 가짜였고 지웠는데
+              이름만 남아 있었다 — 화면이 없는 기능을 광고하면 안 된다.
+              대신 지키기로 한 규격을 적는다. 늘 맞는 말이다.
+            */}
+            <p className="text-[10px] text-slate-500 tracking-widest font-bold">48 kHz · 16-bit · 멀티트랙</p>
           </div>
         </div>
         
@@ -660,7 +1483,7 @@ const App: React.FC = () => {
               <div className="flex bg-slate-800 rounded-xl p-1 border border-slate-700 mr-2">
                 <button 
                   onClick={handleUndo}
-                  disabled={audio.undoStack.length === 0 || audio.isProcessing}
+                  disabled={(comp.undo.length === 0 && audio.undoStack.length === 0) || audio.isProcessing}
                   className="p-2 text-slate-400 hover:text-indigo-400 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors"
                   title="Undo (Ctrl+Z)"
                 >
@@ -668,7 +1491,7 @@ const App: React.FC = () => {
                 </button>
                 <button 
                   onClick={handleRedo}
-                  disabled={audio.redoStack.length === 0 || audio.isProcessing}
+                  disabled={(comp.redo.length === 0 && audio.redoStack.length === 0) || audio.isProcessing}
                   className="p-2 text-slate-400 hover:text-indigo-400 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors"
                   title="Redo (Ctrl+Y)"
                 >
@@ -680,21 +1503,28 @@ const App: React.FC = () => {
                 className="flex items-center gap-2 bg-slate-800 hover:bg-rose-900/30 text-slate-400 hover:text-rose-400 px-4 py-2.5 rounded-xl transition-all border border-slate-700 hover:border-rose-700/50 text-xs font-bold uppercase tracking-wider"
               >
                 <RotateCcw className="w-4 h-4" />
-                Reset
+                초기화
               </button>
               <button 
                 onClick={handleDownloadAction}
                 className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-5 py-2.5 rounded-xl transition-all shadow-lg shadow-indigo-600/20 border border-indigo-400/30 text-xs font-bold uppercase tracking-wider"
               >
                 <Download className="w-4 h-4" />
-                Export
+                내보내기
               </button>
             </>
           )}
+          {/* 트랙 추가 — 여는 게 아니라 더한다. 여러 개를 한 번에 고르면 각자 새 트랙이 된다. */}
           <label className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white px-5 py-2.5 rounded-xl cursor-pointer transition-all border border-emerald-400/30 shadow-lg shadow-emerald-600/20 text-xs font-bold uppercase tracking-wider">
-            <Upload className="w-4 h-4" />
-            Import
-            <input type="file" className="hidden" accept="audio/*,video/*" onChange={(e) => e.target.files && handleFileUpload(e.target.files[0])} />
+            <Layers className="w-4 h-4" />
+            트랙 추가
+            <input
+              type="file"
+              className="hidden"
+              multiple
+              accept="audio/*,video/*"
+              onChange={(e) => { void handleAddTrack(e.target.files); e.target.value = ''; }}
+            />
           </label>
         </div>
       </header>
@@ -715,11 +1545,28 @@ const App: React.FC = () => {
                <span className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></span>
                Ready for Input
             </div>
+
+            {/* 클립 여러 개로 처음부터 시작하는 길. Veo 8초 클립 3~4개를 한 번에 고른다. */}
+            <div className="mt-8 pt-8 border-t border-slate-800">
+              <label className="inline-flex items-center gap-2 px-6 py-3 bg-sky-600 hover:bg-sky-500 text-white rounded-2xl border border-sky-400 text-xs font-black uppercase tracking-widest transition-all cursor-pointer">
+                <input
+                  type="file"
+                  className="hidden"
+                  multiple
+                  accept="audio/*,video/*"
+                  onChange={(e) => { void handleComposerImport(e.target.files, true); e.target.value = ''; }}
+                />
+                <Layers className="w-4 h-4" /> 여러 클립을 이어 붙여 시작
+              </label>
+              <p className="text-slate-600 text-xs mt-3">
+                고른 순서대로 이어 붙고 이음매는 {comp.crossfadeMs} ms 등출력으로 겹칩니다.
+              </p>
+            </div>
           </div>
         ) : (
-          <div className="w-full max-w-7xl space-y-8 animate-in fade-in zoom-in duration-500">
+          <div className="w-full max-w-7xl space-y-6 animate-in fade-in zoom-in duration-500">
             {/* Waveform Visualization Block */}
-            <div className="bg-[#111827] border border-slate-800/80 rounded-[32px] p-8 shadow-2xl relative overflow-hidden ring-1 ring-white/5">
+            <div className="bg-[#111827] border border-slate-800/80 rounded-[28px] p-6 shadow-2xl relative overflow-hidden ring-1 ring-white/5">
               {audio.isProcessing && (
                 <div className="absolute inset-0 z-50 bg-black/60 backdrop-blur-md flex flex-col items-center justify-center">
                   <div className="relative">
@@ -730,212 +1577,183 @@ const App: React.FC = () => {
                 </div>
               )}
 
-              {/* HUD / Info Display */}
-              <div className="flex justify-between items-end mb-10">
-                <div className="flex items-center gap-6">
-                  <div className="bg-slate-800/50 px-4 py-2 rounded-2xl border border-slate-700/50 flex flex-col">
-                    <span className="text-[9px] font-black text-indigo-400 uppercase tracking-widest">Filename</span>
-                    <span className="text-white text-sm font-bold truncate max-w-[200px]">{audio.file?.name}</span>
-                  </div>
-                  <div className="bg-slate-800/50 px-4 py-2 rounded-2xl border border-slate-700/50 flex flex-col">
-                    <span className="text-[9px] font-black text-indigo-400 uppercase tracking-widest">Format</span>
-                    <span className="text-white text-sm font-bold uppercase tracking-tighter">
-                      {audio.isMono ? 'Mono (1CH)' : 'Stereo (2CH)'} · {(PROJECT_SAMPLE_RATE / 1000).toFixed(0)} kHz
-                    </span>
-                  </div>
-                  {audio.sourceKind === 'video' && (
-                    <div className="bg-emerald-500/10 px-4 py-2 rounded-2xl border border-emerald-500/30 flex flex-col">
-                      <span className="text-[9px] font-black text-emerald-400 uppercase tracking-widest flex items-center gap-1">
-                        <Film className="w-3 h-3" /> Source
-                      </span>
-                      <span className="text-emerald-300 text-sm font-bold uppercase tracking-tighter">영상에서 추출</span>
-                    </div>
-                  )}
-                </div>
-
-                <div className="bg-black/40 px-6 py-3 rounded-3xl border border-indigo-500/20 flex flex-col items-end shadow-inner">
-                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] mb-1">Time Elapsed</span>
-                    <span className="text-3xl font-mono font-bold text-white tabular-nums tracking-tighter">
-                      {formatTime(audio.currentTime)} <span className="text-slate-600 text-xl">/ {formatTime(audio.duration)}</span>
-                    </span>
-                </div>
-              </div>
-
-              {/* Waveform Viewport */}
-              <div className="relative group">
-                <div className="absolute top-4 right-4 z-10 flex gap-2">
-                   <div className="bg-black/60 backdrop-blur-md px-3 py-1 rounded-full border border-white/5 text-[9px] font-bold text-slate-400 uppercase">Interactive Layer</div>
-                </div>
-                <div ref={containerRef} className="waveform-container rounded-[24px] bg-[#0d1117] p-6 border border-slate-800/50 shadow-inner" />
-              </div>
-            </div>
-
-            {/* Bottom Controls Panel */}
-            <div className="grid grid-cols-12 gap-6">
-              {/* Main Transport */}
-              <div className="col-span-12 lg:col-span-5 bg-slate-900/60 border border-slate-800 rounded-[28px] p-6 flex items-center justify-between shadow-xl backdrop-blur-md">
-                <div className="flex items-center gap-4">
-                  <button 
-                    onClick={seekToStart} 
-                    title="Skip to Start"
-                    className="w-12 h-12 flex items-center justify-center rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-all hover:-translate-y-1"
-                  >
-                    <SkipBack className="w-5 h-5" />
-                  </button>
-                  <button 
-                    onClick={togglePlay} 
-                    disabled={!audio.isReady || audio.isProcessing}
-                    className="w-16 h-16 flex items-center justify-center rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white transition-all shadow-[0_0_20px_rgba(99,102,241,0.4)] disabled:opacity-50 hover:-translate-y-1 active:scale-95"
-                  >
-                    {audio.isPlaying ? <Pause className="w-8 h-8 fill-current" /> : <Play className="w-8 h-8 ml-1 fill-current" />}
-                  </button>
-                </div>
-
-                <div className="flex flex-col items-center gap-2 flex-1 mx-8">
-                  <div className="flex justify-between w-full text-[9px] font-black text-slate-500 uppercase tracking-widest px-1">
-                    <VolumeX className="w-3 h-3" />
-                    <Volume2 className="w-3 h-3" />
-                  </div>
-                  <input 
-                    type="range" 
-                    min="0" max="1" step="0.01" 
-                    value={audio.volume} 
-                    onChange={handleVolumeChange} 
-                    className="w-full accent-indigo-500 h-1.5 bg-slate-800 rounded-full appearance-none cursor-pointer hover:bg-slate-700 transition-colors"
+              {/*
+                한 줄짜리 정보 띠. 예전에는 칩마다 상자를 두르고 두 줄로 쌓여
+                파형보다 자리를 많이 먹었다. 값은 그대로 두고 테두리를 걷어
+                **얇은 한 줄**로 만들었다 — 이름은 왼쪽에서 늘어나고, 규격·시간은
+                오른쪽에 붙는다.
+              */}
+              <div className="flex flex-wrap items-center gap-x-5 gap-y-3 mb-6 pb-4 border-b border-slate-800/70">
+                {/* 내보낼 이름 — Veo·Suno 이름은 저장소 관례와 안 맞아 여기서 고친다 */}
+                <label className="flex items-baseline gap-2 min-w-[240px] flex-1">
+                  <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest shrink-0">이름</span>
+                  <input
+                    value={exportName}
+                    onChange={(e) => setExportName(e.target.value)}
+                    placeholder={suggestAssetName(audio.file?.name ?? 'untitled.wav')}
+                    spellCheck={false}
+                    className="flex-1 min-w-0 bg-transparent text-white text-base font-bold focus:outline-none border-b border-slate-800 focus:border-indigo-500 transition-colors"
+                    title={`원본: ${audio.file?.name ?? '—'}`}
                   />
-                </div>
+                  <span className="text-slate-600 text-sm font-bold shrink-0">.wav</span>
+                </label>
 
-                <div className="flex gap-2">
-                  <button 
-                    onClick={() => setShowChannelSettings(!showChannelSettings)}
-                    disabled={audio.isMono || audio.isProcessing}
-                    className={`flex flex-col items-center justify-center w-20 h-16 rounded-2xl transition-all border ${
-                      showChannelSettings 
-                      ? 'bg-blue-600 text-white border-blue-400' 
-                      : 'bg-slate-800 text-slate-400 border-slate-700 hover:bg-slate-700'
-                    }`}
-                  >
-                    <Split className="w-5 h-5 mb-1" />
-                    <span className="text-[9px] font-black uppercase tracking-tighter">Channels</span>
-                  </button>
-                  <button 
-                    onClick={handleToggleMono}
-                    disabled={audio.isProcessing}
-                    className={`flex flex-col items-center justify-center w-20 h-16 rounded-2xl transition-all border ${
-                      audio.isMono 
-                      ? 'bg-emerald-600/20 text-emerald-400 border-emerald-500/30' 
-                      : 'bg-slate-800 text-slate-400 border-slate-700 hover:bg-slate-700'
-                    }`}
-                  >
-                    {audio.isMono ? <Columns className="w-5 h-5 mb-1" /> : <Merge className="w-5 h-5 mb-1" />}
-                    <span className="text-[9px] font-black uppercase tracking-tighter">{audio.isMono ? 'Split' : 'Downmix'}</span>
-                  </button>
-                </div>
+                {/*
+                  채널 수는 클립에서 읽는다. 합쳐진 옛 트랙을 보면 모노 트랙에
+                  스테레오를 얹은 뒤에도 계속 "Mono" 라고 우긴다 — 효과음·말 상태음이
+                  모노여야 하는 규격에서 제일 위험한 거짓말이다.
+                */}
+                <span className="text-xs font-bold text-slate-400 whitespace-nowrap tabular-nums">
+                  {composing
+                    ? (compChannels === 1 ? '모노 1ch' : `스테레오 ${compChannels}ch`)
+                    : (audio.isMono ? '모노 1ch' : '스테레오 2ch')
+                  } · {(PROJECT_SAMPLE_RATE / 1000).toFixed(0)} kHz
+                </span>
+
+                {audio.sourceKind === 'video' && (
+                  <span className="flex items-center gap-1 text-xs font-bold text-emerald-400 whitespace-nowrap">
+                    <Film className="w-3 h-3" /> 영상에서 추출
+                  </span>
+                )}
+
+                {/* 규격 판정 — 값이 없으면 내보내 재 보기 전까지 맞는지 알 수가 없다 */}
+                {currentPeak !== null && (() => {
+                  const dbfs = 20 * Math.log10(currentPeak || 1e-9);
+                  const onSpec = Math.abs(dbfs - loop.targetDbfs) < 0.1;
+                  const tooLoud = dbfs > loop.targetDbfs + 0.1;
+                  return (
+                    <span
+                      className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold tabular-nums whitespace-nowrap ${
+                        onSpec ? 'bg-emerald-500/10 text-emerald-300' : 'bg-amber-500/10 text-amber-300'
+                      }`}
+                      title={onSpec ? '규격에 맞음' : tooLoud ? `${loop.targetDbfs} dBFS 보다 큼` : `${loop.targetDbfs} dBFS 에 모자람`}
+                    >
+                      <span className={`w-1.5 h-1.5 rounded-full ${onSpec ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+                      {dbfs.toFixed(2)} dBFS
+                      {/*
+                        전에는 옆에 `−31.5 dB` 만 찍혔다. 라벨이 없어서 그게 피크인지
+                        여유인지 규격까지의 거리인지 알 수 없었다 — 값 두 개가
+                        나란히 있으면 둘 다 피크처럼 읽힌다.
+                      */}
+                      <span className="font-normal opacity-70">
+                        {onSpec
+                          ? `규격 ${loop.targetDbfs} dBFS`
+                          : tooLoud
+                            ? `규격보다 ${(dbfs - loop.targetDbfs).toFixed(1)} dB 큼`
+                            : `규격까지 ${Math.abs(dbfs - loop.targetDbfs).toFixed(1)} dB`}
+                      </span>
+                    </span>
+                  );
+                })()}
+
+                {/* 도크가 떠 있으면 거기 시계가 늘 보이므로 여기서는 접는다 — 같은 값을 두 번 둘 이유가 없다. */}
+                {!composing && (
+                  <span className="ml-auto font-mono font-bold text-white tabular-nums text-xl tracking-tight whitespace-nowrap">
+                    {formatTime(playbackTime)}
+                    <span className="text-slate-600 text-sm"> / {formatTime(playbackDuration)}</span>
+                  </span>
+                )}
               </div>
 
-              {/* Viewport/Zoom Control */}
-              <div className="col-span-12 lg:col-span-3 bg-slate-900/60 border border-slate-800 rounded-[28px] p-6 flex flex-col justify-center gap-3 shadow-xl backdrop-blur-md">
-                <div className="flex justify-between items-center text-[10px] font-black text-slate-500 uppercase tracking-widest">
-                  <div className="flex items-center gap-2"><Minimize2 className="w-3 h-3" /> Overview</div>
-                  <div className="flex items-center gap-2">Detail <Maximize className="w-3 h-3" /></div>
-                </div>
-                <input 
-                  type="range" 
-                  min="10" max="1000" 
-                  value={zoom} 
-                  onChange={handleZoomChange} 
-                  className="w-full accent-indigo-500 h-1.5 bg-slate-800 rounded-full appearance-none cursor-pointer" 
-                />
-              </div>
-
-              {/* Malworld: 마디 격자 · 루프 · 규격 정규화 */}
-              <div className="col-span-12 bg-slate-900/60 border border-emerald-800/40 rounded-[28px] p-6 shadow-xl backdrop-blur-md">
-                <div className="flex items-center justify-between mb-5">
-                  <div className="flex items-center gap-2 text-[10px] font-black text-emerald-400 uppercase tracking-widest">
+              {/*
+                마디 격자는 음악 루프를 만들 때만 쓴다 — 환경음·효과음 작업에서는
+                자리만 차지하므로 접어 둘 수 있게 했고, 파형 **위**로 올려
+                아래까지 스크롤하지 않아도 손이 닿게 했다.
+              */}
+              <div className="bg-slate-900/60 border border-emerald-800/40 rounded-[28px] px-6 py-4 shadow-xl backdrop-blur-md mb-6">
+                <div className={`flex items-center justify-between ${loopLabOpen ? 'mb-5' : ''}`}>
+                  <button
+                    onClick={() => setLoopLabOpen(v => !v)}
+                    className="flex items-center gap-2 text-[10px] font-black text-emerald-400 uppercase tracking-widest hover:text-emerald-300 transition-colors"
+                    title={loopLabOpen ? '마디 격자 접기' : '마디 격자 펴기'}
+                  >
                     <Grid3x3 className="w-3.5 h-3.5" /> Loop Lab · 마디 격자
-                  </div>
+                    <span className="text-slate-500">{loopLabOpen ? '▾' : '▸'}</span>
+                  </button>
                   <div className="text-[10px] font-mono text-slate-500">
                     1마디 = {oneBar.toFixed(4)}초 · {loop.bars}마디 = {(oneBar * loop.bars).toFixed(3)}초
                   </div>
                 </div>
 
-                <div className="flex flex-wrap items-end gap-4">
-                  {numField('BPM', loop.bpm, v => setLoop(p => ({ ...p, bpm: Math.max(1, v) })), { step: 0.1 })}
-                  {numField('박자/마디', loop.beatsPerBar, v => setLoop(p => ({ ...p, beatsPerBar: Math.max(1, Math.round(v)) })), { width: 'w-16' })}
-                  {numField('다운비트', loop.downbeat, v => setLoop(p => ({ ...p, downbeat: Math.max(0, v) })), { step: 0.001, suffix: 's', width: 'w-24' })}
-                  <button
-                    onClick={handleSetDownbeatHere}
-                    disabled={!audio.isReady}
-                    className="px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-slate-300 rounded-xl border border-slate-700 text-[10px] font-black uppercase tracking-widest transition-all"
-                    title="재생 위치를 첫 다운비트로 삼는다"
-                  >
-                    여기를 1박으로
-                  </button>
+                {loopLabOpen && (<>
+                <div className="flex flex-wrap items-stretch gap-3">
+                  {group('격자 잡기', 'text-emerald-500/70', <>
+                    {numField('BPM', loop.bpm, v => setLoop(p => ({ ...p, bpm: Math.max(1, v) })), { step: 0.1 })}
+                    {numField('박자/마디', loop.beatsPerBar, v => setLoop(p => ({ ...p, beatsPerBar: Math.max(1, Math.round(v)) })), { width: 'w-16' })}
+                    {numField('다운비트', loop.downbeat, v => setLoop(p => ({ ...p, downbeat: Math.max(0, v) })), { step: 0.001, suffix: 's', width: 'w-24' })}
+                    <button
+                      onClick={handleSetDownbeatHere}
+                      disabled={!audio.isReady}
+                      className="px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-slate-300 rounded-xl border border-slate-700 text-[10px] font-black uppercase tracking-widest transition-all"
+                      title="재생 위치를 첫 다운비트로 삼는다"
+                    >
+                      여기를 1박으로
+                    </button>
+                  </>)}
 
-                  <div className="w-px h-10 bg-slate-800" />
+                  {group('구간 고르기', 'text-emerald-500/70', <>
+                    {numField('마디 수', loop.bars, v => setLoop(p => ({ ...p, bars: Math.max(1, Math.round(v)) })), { width: 'w-20' })}
+                    <button
+                      onClick={handleSelectBars}
+                      disabled={!audio.isReady}
+                      className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 text-white rounded-xl border border-indigo-400 text-[10px] font-black uppercase tracking-widest transition-all"
+                    >
+                      {loop.bars}마디 선택
+                    </button>
+                    <button
+                      onClick={handleSnapRegion}
+                      disabled={!readoutRegion}
+                      className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-slate-300 rounded-xl border border-slate-700 text-[10px] font-black uppercase tracking-widest transition-all"
+                      title="선택 양 끝을 가장 가까운 마디선으로"
+                    >
+                      <Magnet className="w-3 h-3" /> 마디에 맞춤
+                    </button>
+                  </>)}
 
-                  {numField('마디 수', loop.bars, v => setLoop(p => ({ ...p, bars: Math.max(1, Math.round(v)) })), { width: 'w-20' })}
-                  <button
-                    onClick={handleSelectBars}
-                    disabled={!audio.isReady}
-                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 text-white rounded-xl border border-indigo-400 text-[10px] font-black uppercase tracking-widest transition-all"
-                  >
-                    {loop.bars}마디 선택
-                  </button>
-                  <button
-                    onClick={handleSnapRegion}
-                    disabled={!activeRegion}
-                    className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-slate-300 rounded-xl border border-slate-700 text-[10px] font-black uppercase tracking-widest transition-all"
-                    title="선택 양 끝을 가장 가까운 마디선으로"
-                  >
-                    <Magnet className="w-3 h-3" /> 마디에 맞춤
-                  </button>
+                  {group('루프 만들기', 'text-emerald-500/70', <>
+                    <button
+                      onClick={toggleLoopPreview}
+                      disabled={!readoutRegion}
+                      className={`flex items-center gap-1.5 px-4 py-2 rounded-xl border text-[10px] font-black uppercase tracking-widest transition-all disabled:opacity-30 ${
+                        loop.previewLooping
+                          ? 'bg-emerald-500 text-white border-emerald-300 shadow-lg shadow-emerald-500/30'
+                          : 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
+                      }`}
+                      title="선택 구간을 반복 재생해 이음매를 듣는다"
+                    >
+                      <Repeat className="w-3.5 h-3.5" /> {loop.previewLooping ? '루프 재생 중' : '루프 미리듣기'}
+                    </button>
+                    {numField('꼬리 접기', loop.foldMs, v => setLoop(p => ({ ...p, foldMs: Math.max(0, v) })), { suffix: 'ms', width: 'w-20' })}
+                    <button
+                      onClick={handleMakeLoopAction}
+                      disabled={!editRegion || audio.isProcessing}
+                      className="flex items-center gap-1.5 px-4 py-2 bg-violet-600 hover:bg-violet-500 disabled:opacity-30 text-white rounded-xl border border-violet-400 text-[10px] font-black uppercase tracking-widest transition-all"
+                      title="선택을 루프로 확정하고 뒤쪽 꼬리를 앞머리에 접는다"
+                    >
+                      <Scissors className="w-3.5 h-3.5" /> 루프 제작
+                    </button>
+                  </>)}
 
-                  <div className="w-px h-10 bg-slate-800" />
-
-                  <button
-                    onClick={toggleLoopPreview}
-                    disabled={!activeRegion}
-                    className={`flex items-center gap-1.5 px-4 py-2 rounded-xl border text-[10px] font-black uppercase tracking-widest transition-all disabled:opacity-30 ${
-                      loop.previewLooping
-                        ? 'bg-emerald-500 text-white border-emerald-300 shadow-lg shadow-emerald-500/30'
-                        : 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
-                    }`}
-                    title="선택 구간을 반복 재생해 이음매를 듣는다"
-                  >
-                    <Repeat className="w-3.5 h-3.5" /> {loop.previewLooping ? '루프 재생 중' : '루프 미리듣기'}
-                  </button>
-
-                  {numField('꼬리 접기', loop.foldMs, v => setLoop(p => ({ ...p, foldMs: Math.max(0, v) })), { suffix: 'ms', width: 'w-20' })}
-                  <button
-                    onClick={handleMakeLoopAction}
-                    disabled={!activeRegion || audio.isProcessing}
-                    className="flex items-center gap-1.5 px-4 py-2 bg-violet-600 hover:bg-violet-500 disabled:opacity-30 text-white rounded-xl border border-violet-400 text-[10px] font-black uppercase tracking-widest transition-all"
-                    title="선택을 루프로 확정하고 뒤쪽 꼬리를 앞머리에 접는다"
-                  >
-                    <Scissors className="w-3.5 h-3.5" /> 루프 제작
-                  </button>
-
-                  <div className="w-px h-10 bg-slate-800" />
-
-                  {numField('목표 피크', loop.targetDbfs, v => setLoop(p => ({ ...p, targetDbfs: v })), { step: 0.5, suffix: 'dBFS', width: 'w-20' })}
-                  <button
-                    onClick={handleNormalizeToTargetAction}
-                    disabled={!audio.isReady || audio.isProcessing}
-                    className="flex items-center gap-1.5 px-4 py-2 bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-30 text-amber-400 rounded-xl border border-amber-500/30 text-[10px] font-black uppercase tracking-widest transition-all"
-                    title="저장소 규격은 -3 dBFS 다"
-                  >
-                    <Gauge className="w-3.5 h-3.5" /> 정규화
-                  </button>
+                  {group('규격 맞추기', 'text-amber-500/70', <>
+                    {numField('목표 피크', loop.targetDbfs, v => setLoop(p => ({ ...p, targetDbfs: v })), { step: 0.5, suffix: 'dBFS', width: 'w-20' })}
+                    <button
+                      onClick={handleNormalizeToTargetAction}
+                      disabled={!audio.isReady || audio.isProcessing}
+                      className="flex items-center gap-1.5 px-4 py-2 bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-30 text-amber-400 rounded-xl border border-amber-500/30 text-[10px] font-black uppercase tracking-widest transition-all"
+                      title="저장소 규격은 -3 dBFS 다"
+                    >
+                      <Gauge className="w-3.5 h-3.5" /> 정규화
+                    </button>
+                  </>)}
                 </div>
 
                 {/* 선택 판독 — 격자에 맞았는지를 계속 보여 준다 */}
                 <div className="mt-5 pt-4 border-t border-slate-800 flex flex-wrap items-center gap-x-6 gap-y-2 text-[11px] font-mono">
-                  {activeRegion ? (
+                  {readoutRegion ? (
                     <>
-                      <span className="text-slate-500">시작 <span className="text-white font-bold">{activeRegion.start.toFixed(4)}s</span></span>
-                      <span className="text-slate-500">끝 <span className="text-white font-bold">{activeRegion.end.toFixed(4)}s</span></span>
-                      <span className="text-slate-500">길이 <span className="text-white font-bold">{(activeRegion.end - activeRegion.start).toFixed(4)}s</span></span>
+                      <span className="text-slate-500">시작 <span className="text-white font-bold">{readoutRegion.start.toFixed(4)}s</span></span>
+                      <span className="text-slate-500">끝 <span className="text-white font-bold">{readoutRegion.end.toFixed(4)}s</span></span>
+                      <span className="text-slate-500">길이 <span className="text-white font-bold">{(readoutRegion.end - readoutRegion.start).toFixed(4)}s</span></span>
                       <span className={`font-bold px-2 py-0.5 rounded-lg ${selOnGrid ? 'bg-emerald-500/15 text-emerald-400' : 'bg-rose-500/15 text-rose-400'}`}>
                         {selBars.toFixed(3)}마디 {selOnGrid ? '· 격자에 맞음' : '· 격자에서 벗어남'}
                       </span>
@@ -944,245 +1762,564 @@ const App: React.FC = () => {
                     <span className="text-slate-600">파형을 드래그하거나 위의 “{loop.bars}마디 선택”을 누르십시오.</span>
                   )}
                 </div>
+                </>)}
               </div>
 
-              {/* Contextual Actions Panel */}
-              <div className="col-span-12 lg:col-span-4 flex items-center gap-3 relative">
-                {activeRegion ? (
-                  <div className="flex items-center gap-2 w-full bg-indigo-900/20 border border-indigo-500/30 p-3 rounded-[28px] backdrop-blur-md shadow-lg">
-                    <button 
-                      onClick={playRegion}
-                      className="flex-1 flex flex-col items-center gap-1 p-2 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 rounded-2xl transition-all border border-emerald-500/20"
-                      title="Play Only Selection"
-                    >
-                      <PlayCircle className="w-4 h-4" />
-                      <span className="text-[8px] font-bold uppercase">Listen</span>
-                    </button>
-                    <button 
-                      onClick={handleAnalyzeNoiseAction}
-                      className="flex-1 flex flex-col items-center gap-1 p-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 rounded-2xl transition-all border border-amber-500/20"
-                      title="Sample Noise"
-                    >
-                      <Fingerprint className="w-4 h-4" />
-                      <span className="text-[8px] font-bold uppercase">Sample</span>
-                    </button>
-                    <button 
-                      onClick={() => handleFadeAction('in')}
-                      className="flex-1 flex flex-col items-center gap-1 p-2 bg-slate-800/80 hover:bg-indigo-600 hover:text-white rounded-2xl transition-all border border-slate-700"
-                    >
-                      <TrendingUp className="w-4 h-4" />
-                      <span className="text-[8px] font-bold uppercase">In</span>
-                    </button>
-                    <button 
-                      onClick={() => handleFadeAction('out')}
-                      className="flex-1 flex flex-col items-center gap-1 p-2 bg-slate-800/80 hover:bg-indigo-600 hover:text-white rounded-2xl transition-all border border-slate-700"
-                    >
-                      <TrendingDown className="w-4 h-4" />
-                      <span className="text-[8px] font-bold uppercase">Out</span>
-                    </button>
-                    <button 
-                      onClick={handleCropAction}
-                      className="flex-1 flex flex-col items-center gap-1 p-2 bg-violet-500/10 hover:bg-violet-500/20 text-violet-400 rounded-2xl transition-all border border-violet-500/20"
-                      title="Show Only Selection"
-                    >
-                      <Crop className="w-4 h-4" />
-                      <span className="text-[8px] font-bold uppercase">Crop</span>
-                    </button>
-                    <button 
-                      onClick={handleCutAction}
-                      className="flex-1 flex flex-col items-center gap-1 p-2 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 rounded-2xl transition-all border border-rose-500/20"
-                    >
-                      <Scissors className="w-4 h-4" />
-                      <span className="text-[8px] font-bold uppercase">Cut</span>
-                    </button>
-                    <button 
-                      onClick={clearRegion} 
-                      className="p-3 bg-slate-800 hover:bg-slate-700 text-slate-400 rounded-full transition-all border border-slate-700"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-3 w-full">
-                    <div className="flex-1 relative">
-                       <button 
-                        onClick={handleNormalizeAction}
-                        className="w-full flex items-center justify-center gap-2 py-4 bg-slate-900/60 hover:bg-slate-800 text-slate-300 rounded-[28px] border border-slate-800 transition-all font-bold uppercase tracking-widest text-xs"
-                      >
-                        <Activity className="w-4 h-4 text-indigo-400" /> Max
-                      </button>
-                    </div>
-
-                    <div className="flex-1 relative">
-                      <button 
-                        onClick={() => setAudio(prev => ({ ...prev, showGainSettings: !prev.showGainSettings, showGateSettings: false }))}
-                        className={`w-full flex items-center justify-center gap-2 py-4 transition-all font-bold uppercase tracking-widest text-xs rounded-[28px] border ${
-                          audio.showGainSettings 
-                          ? 'bg-purple-600 text-white border-purple-400 shadow-lg shadow-purple-600/20' 
-                          : 'bg-slate-900/60 hover:bg-slate-800 text-slate-300 border-slate-800'
-                        }`}
-                      >
-                        <Plus className={`w-4 h-4 ${audio.showGainSettings ? 'text-white' : 'text-purple-500'}`} /> Gain
-                      </button>
-
-                      {audio.showGainSettings && (
-                        <div className="absolute bottom-full left-0 w-full mb-4 bg-[#1e293b]/95 backdrop-blur-xl border border-purple-500/30 p-6 rounded-[28px] shadow-2xl animate-in fade-in slide-in-from-bottom-2 duration-200 z-[100]">
-                          <div className="flex justify-between items-center mb-4">
-                            <span className="text-[10px] font-black text-purple-400 uppercase tracking-widest">Gain Multiplier</span>
-                            <span className="text-[10px] font-mono text-white bg-purple-500/20 px-2 py-1 rounded-md">
-                              {audio.gainMultiplier.toFixed(2)}x
-                            </span>
-                          </div>
-                          <input 
-                            type="range" 
-                            min="0.1" max="5.0" step="0.1" 
-                            value={audio.gainMultiplier} 
-                            onChange={(e) => setAudio(prev => ({ ...prev, gainMultiplier: parseFloat(e.target.value) }))}
-                            className="w-full accent-purple-500 h-1.5 bg-slate-800 rounded-full appearance-none cursor-pointer mb-6" 
-                          />
-                          <div className="flex gap-2">
-                            <button 
-                              onClick={() => setAudio(prev => ({ ...prev, showGainSettings: false }))}
-                              className="flex-1 py-2 rounded-xl bg-slate-800 text-slate-400 text-[10px] font-bold uppercase hover:bg-slate-700 border border-slate-700 transition-colors"
-                            >
-                              Cancel
-                            </button>
-                            <button 
-                              onClick={handleGainAction}
-                              className="flex-[2] py-2 rounded-xl bg-purple-600 text-white text-[10px] font-bold uppercase hover:bg-purple-500 transition-colors flex items-center justify-center gap-2"
-                            >
-                              <Check className="w-3 h-3" /> Apply Gain
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                    
-                    {audio.noiseProfile ? (
-                       <button 
-                        onClick={handleCleanAtmosphereAction}
-                        className="flex-1 flex items-center justify-center gap-2 py-4 bg-indigo-600 text-white hover:bg-indigo-500 rounded-[28px] transition-all border border-indigo-400 shadow-xl shadow-indigo-600/30 animate-pulse-subtle font-bold uppercase tracking-widest text-xs"
-                      >
-                        <Sparkles className="w-4 h-4" /> Clear
-                      </button>
-                    ) : (
-                      <div className="flex-1 relative">
-                        <button 
-                          onClick={() => setAudio(prev => ({ ...prev, showGateSettings: !prev.showGateSettings, showGainSettings: false }))}
-                          className={`w-full flex items-center justify-center gap-2 py-4 transition-all font-bold uppercase tracking-widest text-xs rounded-[28px] border ${
-                            audio.showGateSettings 
-                            ? 'bg-indigo-600 text-white border-indigo-400 shadow-lg shadow-indigo-600/20' 
-                            : 'bg-slate-900/60 hover:bg-slate-800 text-slate-300 border-slate-800'
-                          }`}
-                        >
-                          {audio.showGateSettings ? <SlidersHorizontal className="w-4 h-4" /> : <Wind className="w-4 h-4 text-slate-500" />}
-                          Gate
-                        </button>
-
-                        {audio.showGateSettings && (
-                          <div className="absolute bottom-full left-0 w-full mb-4 bg-[#1e293b]/95 backdrop-blur-xl border border-indigo-500/30 p-6 rounded-[28px] shadow-2xl animate-in fade-in slide-in-from-bottom-2 duration-200 z-[100]">
-                            <div className="flex justify-between items-center mb-4">
-                              <span className="text-[10px] font-black text-indigo-400 uppercase tracking-widest">Gate Thresh</span>
-                              <span className="text-[10px] font-mono text-white bg-indigo-500/20 px-2 py-1 rounded-md">
-                                {Math.round(audio.gateThreshold * 1000) / 10}%
-                              </span>
-                            </div>
-                            <input 
-                              type="range" 
-                              min="0.001" max="0.1" step="0.001" 
-                              value={audio.gateThreshold} 
-                              onChange={(e) => setAudio(prev => ({ ...prev, gateThreshold: parseFloat(e.target.value) }))}
-                              className="w-full accent-indigo-500 h-1.5 bg-slate-800 rounded-full appearance-none cursor-pointer mb-6" 
-                            />
-                            <div className="flex gap-2">
-                              <button 
-                                onClick={() => setAudio(prev => ({ ...prev, showGateSettings: false }))}
-                                className="flex-1 py-2 rounded-xl bg-slate-800 text-slate-400 text-[10px] font-bold uppercase hover:bg-slate-700 border border-slate-700 transition-colors"
-                              >
-                                Cancel
-                              </button>
-                              <button 
-                                onClick={handleDenoiseAction}
-                                className="flex-[2] py-2 rounded-xl bg-indigo-600 text-white text-[10px] font-bold uppercase hover:bg-indigo-500 transition-colors flex items-center justify-center gap-2"
-                              >
-                                <Check className="w-3 h-3" /> Apply Gate
-                              </button>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )}
-                
-                {/* Channel Controls Dropdown Overlay */}
-                {showChannelSettings && !audio.isMono && (
-                   <div className="absolute bottom-full left-0 w-full mb-4 bg-slate-900/95 backdrop-blur-2xl border border-blue-500/30 p-6 rounded-[32px] shadow-[0_20px_50px_rgba(0,0,0,0.5)] animate-in fade-in slide-in-from-bottom-4 duration-300 z-[101]">
-                      <div className="flex items-center gap-3 mb-6">
-                        <div className="p-2 bg-blue-500/20 rounded-lg text-blue-400">
-                          <Zap className="w-4 h-4" />
-                        </div>
-                        <h3 className="text-xs font-black text-white uppercase tracking-[0.2em]">Spatial Processor</h3>
-                      </div>
-                      
-                      <div className="grid grid-cols-2 gap-4 mb-4">
-                        <div className="space-y-2">
-                          <span className="text-[9px] font-black text-blue-400 uppercase tracking-widest block mb-2 px-1">Left Channel [0]</span>
-                          <button 
-                            onClick={() => handleExtractChannelAction(0)}
-                            className="w-full py-3 bg-blue-600/10 hover:bg-blue-600/30 text-blue-300 rounded-2xl border border-blue-500/20 text-[10px] font-bold uppercase transition-all flex items-center justify-center gap-2"
-                          >
-                            <Volume2 className="w-3 h-3" /> Isolate (Mono)
-                          </button>
-                          <button 
-                             onClick={() => handleSilenceChannelAction(0)}
-                             className="w-full py-3 bg-slate-800/80 hover:bg-rose-600/20 text-slate-400 hover:text-rose-400 rounded-2xl border border-slate-700 hover:border-rose-500/30 text-[10px] font-bold uppercase transition-all flex items-center justify-center gap-2"
-                          >
-                            <VolumeX className="w-3 h-3" /> Remove (Mute)
-                          </button>
-                        </div>
-                        <div className="space-y-2">
-                          <span className="text-[9px] font-black text-purple-400 uppercase tracking-widest block mb-2 px-1">Right Channel [1]</span>
-                          <button 
-                             onClick={() => handleExtractChannelAction(1)}
-                             className="w-full py-3 bg-purple-600/10 hover:bg-purple-600/30 text-purple-300 rounded-2xl border border-purple-500/20 text-[10px] font-bold uppercase transition-all flex items-center justify-center gap-2"
-                          >
-                            <Volume2 className="w-3 h-3" /> Isolate (Mono)
-                          </button>
-                          <button 
-                             onClick={() => handleSilenceChannelAction(1)}
-                             className="w-full py-3 bg-slate-800/80 hover:bg-rose-600/20 text-slate-400 hover:text-rose-400 rounded-2xl border border-slate-700 hover:border-rose-500/30 text-[10px] font-bold uppercase transition-all flex items-center justify-center gap-2"
-                          >
-                            <VolumeX className="w-3 h-3" /> Remove (Mute)
-                          </button>
-                        </div>
-                      </div>
-                      
-                      <button 
-                        onClick={() => setShowChannelSettings(false)}
-                        className="w-full py-3 bg-slate-800 rounded-2xl text-slate-500 hover:text-white transition-all text-[10px] font-bold uppercase mt-4"
-                      >
-                        Close Tools
-                      </button>
+              {/*
+                Interactive Layer — 트랙이 편집점이다.
+                클립이 문서이므로 여기가 배치·선택·재생이 모두 일어나는 자리고,
+                아래 wavesurfer 는 합쳐진 결과를 확인하는 보조 화면으로 내려갔다.
+              */}
+              <div className="relative group">
+                <div className="absolute top-4 right-4 z-20 flex gap-2">
+                   <div className="bg-black/60 backdrop-blur-md px-3 py-1 rounded-full border border-white/5 text-[9px] font-bold text-slate-400 uppercase">
+                     멀티트랙 · 트랙 {Math.max(usedLanes, comp.minLanes)}개
                    </div>
-                )}
+                </div>
+                <div className="rounded-[24px] bg-[#0d1117] px-6 pt-6 pb-2 border border-slate-800/50 shadow-inner">
+                  {comp.clips.length === 0 && comp.minLanes === 0 ? (
+                    <div className="py-14 text-center text-slate-600 text-sm">
+                      위쪽 <span className="text-emerald-400 font-bold">트랙 추가</span> 로 트랙을 얹으십시오.
+                      끌어다 놓아도 됩니다.
+                    </div>
+                  ) : (
+                    <CompositionTimeline
+                      clips={comp.clips}
+                      crossfadeMs={comp.crossfadeMs}
+                      minLanes={comp.minLanes}
+                      onChange={updateClip}
+                      onBeginEdit={pushUndo}
+                      onAddLane={() => setComp(p => ({ ...p, minLanes: Math.max(usedLanes, p.minLanes) + 1 }))}
+                      onRemoveLane={() => setComp(p => ({ ...p, minLanes: Math.max(usedLanes, p.minLanes - 1) }))}
+                      onMoveLane={(from, to) => commitClips(moveTrack(comp.clips, from, to))}
+                      onRemoveTrack={(lane) => {
+                        const doomed = comp.clips.filter(c => c.lane === lane);
+                        if (doomed.length > 0 && !confirm(
+                          `트랙 ${lane} 을 뺍니다. 올라가 있는 클립 ${doomed.length}개도 함께 지워지고 아래 트랙이 올라옵니다.\n되돌리기로 살릴 수 있습니다. 계속할까요?`
+                        )) return;
+                        commitClips(removeTrack(comp.clips, lane));
+                        setComp(p => ({ ...p, minLanes: Math.max(0, p.minLanes - 1) }));
+                        setSelection(null);
+                      }}
+                      canRemoveLane={comp.minLanes > usedLanes}
+                      currentTime={playback.currentTime}
+                      onSeek={playback.seek}
+                      zoom={zoomFactor}
+                      onZoomChange={setZoomFactor}
+                      selectedClipId={selectedClipId}
+                      onSelectClip={setSelectedClipId}
+                      selection={selection}
+                      onSelectionChange={handleSelectionChange}
+                    />
+                  )}
+                </div>
               </div>
+
+              {/*
+                합친 결과 — 편집면이 아니라 보조 화면이다.
+                내보내기는 트랙에서 바로 굽기 때문에 이걸 만들지 않아도 되고,
+                남아 있는 이유는 마디 격자(Loop Lab)가 트랙 하나를 전제로 해서다.
+              */}
+              {/*
+                합친 결과는 마디 격자를 쓸 때만 필요하다 — 이름에도 그렇게 적혀 있다.
+                Loop Lab 과 함께 접어 두면 평소에 130 px 을 돌려받는다.
+              */}
+              {loopLabOpen && (
+              <div className="relative group mt-6">
+                <div className="absolute top-3 right-4 z-10 flex items-center gap-2">
+                   <div className="bg-black/60 backdrop-blur-md px-3 py-1 rounded-full border border-white/5 text-[9px] font-bold text-slate-500 uppercase">
+                     합친 결과 · 마디 격자용
+                   </div>
+                </div>
+                {comp.clips.length > 0 && !audio.currentUrl && (
+                  <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none">
+                    <span className="text-slate-600 text-xs">
+                      “합친 결과 만들기”를 누르면 여기에 놓입니다 — 내보내기에는 필요 없습니다.
+                    </span>
+                  </div>
+                )}
+                <div ref={containerRef} className="waveform-container rounded-[24px] bg-[#0d1117] px-6 py-4 border border-slate-800/50 shadow-inner" />
+              </div>
+              )}
+            </div>
+
+            {/* 재생·볼륨·모노는 화면 아래 도크로 옮겼다 — 중간에 또 두면 같은 것이 두 군데가 된다. */}
+            <div className="grid grid-cols-12 gap-6">
+              {/* Malworld: 병합 작업대 — 클립을 더해 가며 한 트랙으로 굽는다 */}
+              <div className="col-span-12 bg-slate-900/60 border border-sky-800/40 rounded-[24px] p-5 shadow-xl backdrop-blur-md">
+                <div className={`flex items-center justify-between ${mergePanelOpen ? 'mb-5' : ''}`}>
+                  <button
+                    onClick={() => setMergePanelOpen(v => !v)}
+                    className="flex items-center gap-2 text-[10px] font-black text-sky-400 uppercase tracking-widest hover:text-sky-300 transition-colors"
+                    title={mergePanelOpen ? '병합 작업대 접기' : '병합 작업대 펴기'}
+                  >
+                    <Layers className="w-3.5 h-3.5" /> 병합 작업대 · 클립 {comp.clips.length}개
+                    <span className="text-slate-500">{mergePanelOpen ? '▾' : '▸'}</span>
+                  </button>
+                  <div className="text-[10px] font-mono text-slate-500">
+                    {comp.clips.length > 0
+                      ? `결과 ${compResultSec.toFixed(3)}초 · ${compChannels === 1 ? '모노' : `${compChannels}채널`} · 48 kHz`
+                      : '클립을 담으십시오'}
+                  </div>
+                </div>
+
+                {mergePanelOpen && (<>
+                <div className="flex flex-wrap items-stretch gap-3 mb-5">
+                  {group('같은 트랙에 이어 붙이기', 'text-sky-500/70', <>
+                    <label
+                      className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-xl border border-sky-400 text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer"
+                      title="트랙 0 뒤에 이음매를 겹쳐 이어 붙인다 (길이가 늘어난다). 위쪽 “트랙 추가”는 새 트랙에 나란히 얹는다."
+                    >
+                      <input
+                        type="file"
+                        className="hidden"
+                        multiple
+                        accept="audio/*,video/*"
+                        onChange={(e) => { void handleComposerImport(e.target.files, false); e.target.value = ''; }}
+                      />
+                      뒤에 이어 담기
+                    </label>
+                    <button
+                      onClick={handleAddCurrentAsClip}
+                      disabled={!audio.isReady || audio.isProcessing}
+                      className="px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-slate-300 rounded-xl border border-slate-700 text-[10px] font-black uppercase tracking-widest transition-all"
+                      title="지금 편집 중인 트랙을 한 번 더 담는다 (담긴 게 없으면 자동으로 들어간다)"
+                    >
+                      현재 트랙
+                    </button>
+                    
+                  </>)}
+
+                  {/* 빈 트랙 +/− 는 타임라인의 `새 트랙` 줄로 옮겼다 — 트랙을 보고 있는
+                      자리에 두는 편이 낫고, 같은 버튼이 두 군데 있으면 어느 쪽이 진짜인지 헷갈린다. */}
+                  {group('길이 늘리기', 'text-sky-500/70', <>
+                    {numField('무음', comp.silenceSec, v => setComp(p => ({ ...p, silenceSec: Math.max(0.001, v) })), { step: 0.5, suffix: 's', width: 'w-20' })}
+                    <button
+                      onClick={handleAddSilence}
+                      className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl border border-slate-700 text-[10px] font-black uppercase tracking-widest transition-all"
+                      title="트랙 0 뒤에 무음을 붙여 결과 길이를 늘린다 (모노라 채널 수는 안 바뀐다)"
+                    >
+                      뒤에 무음
+                    </button>
+                    
+                  </>)}
+
+                  {/* 자르기·끼워넣기와 굽기 버튼은 화면 아래 도크에 있다 — 같은 것을 두 군데 두지 않는다. */}
+                  {group('이음매 · 굽기 (내보내기에도 적용)', 'text-sky-500/70', <>
+                    {numField('크로스페이드', comp.crossfadeMs, v => setComp(p => ({ ...p, crossfadeMs: Math.max(0, v) })), { suffix: 'ms', width: 'w-24' })}
+                    {numField('끝→시작 말기', comp.wrapMs, v => setComp(p => ({ ...p, wrapMs: Math.max(0, v) })), { suffix: 'ms', width: 'w-24' })}
+                    <label
+                      className="flex items-center gap-2 px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl cursor-pointer"
+                      title={`피크를 ${loop.targetDbfs} dBFS 로 맞춘다. 내보낼 때도 똑같이 걸린다.`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={comp.normalizeAfter}
+                        onChange={(e) => setComp(p => ({ ...p, normalizeAfter: e.target.checked }))}
+                        className="accent-amber-500"
+                      />
+                      <span className="text-[10px] font-black text-amber-400 tracking-widest whitespace-nowrap">
+                        {loop.targetDbfs} dBFS 로 맞춤
+                      </span>
+                    </label>
+                  </>)}
+
+                  {/*
+                    이 묶음은 "굽기"다. 내보내기도 같은 설정을 거치므로 여기 값이
+                    곧 내보낼 파일의 값이다 — 그래서 이름에 그렇게 적어 뒀다.
+                  */}
+
+                  {/*
+                    게이트는 폭을 다 차지하는 알약 버튼으로 패널 **밖에** 떠 있었다.
+                    카드 바깥에 홀로 놓이니 어디에 걸리는 것인지 알 수 없었고,
+                    혼자 화면 폭을 다 먹어 제일 중요한 것처럼 보였다. 다른 묶음과
+                    같은 모양으로 줄여 패널 안에 넣는다.
+
+                    어택·릴리스가 없어 문턱 아래를 표본마다 0 으로 떨군다.
+                    디지털 무음을 자르는 데만 쓰고, 게이트로 쓰면 지퍼 노이즈가 난다.
+                  */}
+                  {group('잔 소리 다듬기', 'text-slate-500', <>
+                    <label className="flex flex-col gap-1">
+                      <span className="text-[9px] font-black text-slate-500 tracking-widest px-1">
+                        문턱값 {(audio.gateThreshold * 100).toFixed(1)}%
+                      </span>
+                      <input
+                        type="range"
+                        min="0.001" max="0.1" step="0.001"
+                        value={audio.gateThreshold}
+                        onChange={(e) => setAudio(prev => ({ ...prev, gateThreshold: parseFloat(e.target.value) }))}
+                        className="w-28 accent-indigo-500 cursor-pointer"
+                        title="이 크기 아래의 표본을 0 으로 떨군다 — 디지털 무음을 자르는 용도다"
+                      />
+                    </label>
+                    <button
+                      onClick={handleDenoiseAction}
+                      disabled={audio.isProcessing}
+                      className="flex items-center gap-1.5 px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-slate-300 rounded-xl border border-slate-700 text-[10px] font-black uppercase tracking-widest transition-all"
+                      title="문턱 아래를 0 으로 떨군다. 잔향이 있는 자료에는 쓰지 마십시오 — 꼬리가 뚝 끊긴다."
+                    >
+                      <Wind className="w-3.5 h-3.5" /> 무음 다듬기
+                    </button>
+                  </>)}
+
+                </div>
+
+                {/* 트랙별 파형은 위 Interactive Layer 로 올라갔다. 여기는 정확한 값과 합치기 설정 몫이다. */}
+
+                {/* 클립 목록 — 정확한 값은 여기서 넣는다 */}
+                {comp.clips.length > 0 && (
+                  <div className="border-t border-slate-800 pt-4 mt-4 flex flex-col gap-2">
+                    {comp.clips.map((c) => (
+                      <div key={c.id} className="flex flex-wrap items-center gap-3 bg-slate-950/60 border border-slate-800 rounded-xl px-3 py-2">
+                        <span className="text-[11px] font-bold text-white truncate max-w-[220px]" title={c.name}>{c.name}</span>
+                        <span className="text-[10px] font-mono text-slate-500">
+                          {c.buffer.duration.toFixed(3)}초 · {c.buffer.numberOfChannels === 1 ? '모노' : '스테레오'}
+                        </span>
+
+                        <div className="flex items-center gap-1">
+                          <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest">트랙</span>
+                          <input
+                            type="number" min={0} value={c.lane}
+                            onChange={(e) => updateClipField(c.id, { lane: Math.max(0, parseInt(e.target.value) || 0) })}
+                            className="w-14 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs font-bold text-white focus:border-sky-500 focus:outline-none"
+                          />
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest">시작</span>
+                          <input
+                            type="number" step={0.001} min={0} value={c.startSec}
+                            onChange={(e) => updateClipField(c.id, { startSec: Math.max(0, parseFloat(e.target.value) || 0) })}
+                            className="w-24 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs font-bold text-white focus:border-sky-500 focus:outline-none"
+                          />
+                          <span className="text-[9px] text-slate-600">s</span>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest">게인</span>
+                          <input
+                            type="number" step={0.05} min={0} value={c.gain}
+                            onChange={(e) => updateClipField(c.id, { gain: Math.max(0, parseFloat(e.target.value) || 0) })}
+                            className="w-16 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs font-bold text-white focus:border-sky-500 focus:outline-none"
+                          />
+                        </div>
+                        <span className="text-[10px] font-mono text-slate-600">
+                          {c.startSec.toFixed(3)} → {clipEndSec(c).toFixed(3)}초
+                        </span>
+
+                        <div className="ml-auto flex items-center gap-2">
+                          <button
+                            onClick={() => copyClip(c.id)}
+                            className={`px-2 py-1 rounded-lg border text-[9px] font-black uppercase tracking-widest transition-all ${
+                              comp.clipboard?.id === c.id
+                                ? 'bg-violet-500 text-white border-violet-300'
+                                : 'bg-violet-500/10 hover:bg-violet-500/20 text-violet-400 border-violet-500/30'
+                            }`}
+                            title="이 클립을 복사해 둔다 (⌘/Ctrl+C)"
+                          >
+                            <Copy className="w-3 h-3 inline mr-1" />
+                            {comp.clipboard?.id === c.id ? '담김' : '클립 복사'}
+                          </button>
+                          <button
+                            onClick={() => stackClip(c.id)}
+                            className="px-2 py-1 bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 rounded-lg border border-sky-500/30 text-[9px] font-black uppercase tracking-widest transition-all"
+                            title="새 트랙 0초로 옮겨 겹치게 한다"
+                          >
+                            겹치기
+                          </button>
+                          <button
+                            onClick={() => removeClip(c.id)}
+                            className="p-1.5 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 rounded-lg border border-rose-500/30 transition-all"
+                            title="클립 빼기"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* 판독 — 합산이 넘쳤는지 여기서 본다 */}
+                <div className="mt-5 pt-4 border-t border-slate-800 flex flex-wrap items-center gap-x-6 gap-y-2 text-[11px] font-mono">
+                  {comp.clips.length === 0 ? (
+                    <span className="text-slate-600">
+                      담으면 같은 트랙 뒤에 이어 붙습니다 (길이가 늘어남). “겹치기”를 누르면 새 트랙에서 병렬로 울립니다.
+                    </span>
+                  ) : (
+                    <>
+                      <span className="text-slate-500">결과 길이 <span className="text-white font-bold">{compResultSec.toFixed(4)}s</span></span>
+                      <span className="text-slate-500">트랙 <span className="text-white font-bold">{compLanes}</span></span>
+                      {comp.lastPeak !== null && (
+                        <span className={`font-bold px-2 py-0.5 rounded-lg ${
+                          comp.lastPeak > 1 ? 'bg-rose-500/15 text-rose-400' : 'bg-emerald-500/15 text-emerald-400'
+                        }`}>
+                          합산 피크 {(20 * Math.log10(comp.lastPeak || 1e-9)).toFixed(2)} dBFS
+                          {comp.lastPeak > 1
+                            ? (comp.normalizeAfter ? ' · 넘쳤지만 정규화로 되돌림' : ' · 넘쳐서 0 dBFS 로 눌러 담음')
+                            : ' · 여유 있음'}
+                        </span>
+                      )}
+                      {comp.wrapMs > 0 && (
+                        <span className="text-sky-400">끝 {comp.wrapMs} ms 를 앞에 접어 길이가 그만큼 줄어듭니다</span>
+                      )}
+                    </>
+                  )}
+                </div>
+                </>)}
+              </div>
+
+
             </div>
           </div>
         )}
       </main>
 
-      <footer className="mt-12 flex items-center justify-center gap-10">
-        <div className="flex items-center gap-2 text-slate-600">
-           <div className="w-1.5 h-1.5 rounded-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,1)]"></div>
-           <span className="text-[9px] font-black uppercase tracking-[0.2em]">Engine Stable</span>
+      {/*
+        푸터에 `ENGINE STABLE` · `HARDWARE ACCELERATED PROCESSING NODE` ·
+        `n초 CACHE` 가 있었다. 지웠다 — 셋 다 아무 상태도 안 나타내는 장식인데
+        도크 바로 위에서 두 줄을 먹었고, 마지막 것은 캐시가 아니라 그냥 길이였다.
+      */}
+
+      {/*
+        트랙 편집 도크.
+        편집 컨트롤이 페이지 맨 아래에 있어서, 파형을 보면서 한 번 자르려면
+        **끝까지 스크롤해 내려갔다 다시 올라와야 했다.** 자주 누르는 것만 골라
+        화면 아래에 붙여 두고, 나머지 설정(이음매·클립 목록)은 아래 패널에 남겼다.
+      */}
+      {composing && (
+        <div ref={dockRef} className="fixed bottom-0 left-0 right-0 z-40 bg-slate-900/92 backdrop-blur-xl border-t border-slate-700/70 shadow-[0_-8px_30px_rgba(0,0,0,0.5)]">
+          <div className="max-w-7xl mx-auto px-3 py-1.5 flex items-center gap-2">
+            {/*
+              도크를 두 칸으로 나눈다. 왼쪽은 편집 묶음이 폭에 맞춰 접히는 자리,
+              오른쪽은 마무리(모노·합치기)를 못 박은 자리다.
+              전에는 마무리에 `ml-auto` 만 걸어 뒀는데, 폭이 19 px 모자라면
+              **둘만 다음 줄 오른쪽 끝으로 떨어져** 텅 빈 줄에 떠 있었다.
+              이제 마무리는 늘 오른쪽 같은 자리에 있고 왼쪽만 접힌다.
+            */}
+            <div className="flex-1 min-w-0 flex flex-wrap items-center gap-1">
+
+            {/*
+              묶음마다 옅은 상자에 담는다. 단추 열일곱 개를 한 줄에 흘려 두면
+              무엇이 무엇과 한 벌인지 안 보인다 — 패널에서 쓴 것과 같은 방식이되,
+              도크는 높이가 아까우니 이름표 없이 상자만으로 가른다.
+            */}
+
+            {/* 듣기 */}
+            <div className="flex items-center gap-1 rounded-lg bg-slate-950/50 border border-slate-800 px-1.5 py-1">
+              <button
+                onClick={seekToStart}
+                title="처음으로"
+                className="w-8 h-8 shrink-0 flex items-center justify-center rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-all"
+              >
+                <SkipBack className="w-3.5 h-3.5" />
+              </button>
+              <button
+                onClick={togglePlay}
+                disabled={audio.isProcessing}
+                title="재생 / 멈춤"
+                className="w-9 h-9 shrink-0 flex items-center justify-center rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 text-white shadow-lg shadow-indigo-600/30 transition-all"
+              >
+                {isPlayingNow ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 ml-0.5 fill-current" />}
+              </button>
+              <span className="font-mono font-bold text-white tabular-nums text-xs shrink-0 w-[84px] leading-tight">
+                {formatTime(playbackTime)}
+                <span className="text-slate-600 block">{formatTime(playbackDuration)}</span>
+              </span>
+              <button
+                onClick={toggleLoopPreview}
+                disabled={!selection || selection.end <= selection.start}
+                className={`h-8 px-2 shrink-0 flex items-center gap-1 rounded-lg border text-[10px] font-black uppercase tracking-widest transition-all disabled:opacity-30 ${
+                  loop.previewLooping
+                    ? 'bg-emerald-500 text-white border-emerald-300 shadow-lg shadow-emerald-500/30'
+                    : 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
+                }`}
+                title={selection ? '고른 구간을 되풀이해 이음매를 듣는다' : '먼저 트랙에서 구간을 고르십시오'}
+              >
+                <Repeat className="w-3.5 h-3.5" /> {loop.previewLooping ? '반복 중' : '반복'}
+              </button>
+              <input
+                type="range" min="0" max="1" step="0.01"
+                value={audio.volume}
+                onChange={handleVolumeChange}
+                className="w-12 shrink-0 accent-indigo-500 h-1.5 bg-slate-800 rounded-full appearance-none cursor-pointer"
+                title="듣기 볼륨 (내보내는 파일과는 무관하다)"
+              />
+            </div>
+
+            {/* 자르고 붙이기 */}
+            <div className="flex items-center gap-1 rounded-lg bg-slate-950/50 border border-slate-800 px-1.5 py-1">
+              <button
+                onClick={handleSplitAtPlayhead}
+                className="h-8 px-2 flex items-center gap-1 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 rounded-lg border border-rose-500/30 text-[10px] font-black uppercase tracking-widest transition-all"
+                title="재생 헤드 자리에서 클립을 둘로 쪼갠다"
+              >
+                <SeparatorVertical className="w-3.5 h-3.5" /> 쪼개기
+              </button>
+              <button
+                onClick={handleCopyRange}
+                disabled={!clipRegion}
+                className="h-8 px-2 flex items-center gap-1 bg-violet-500/10 hover:bg-violet-500/20 disabled:opacity-30 text-violet-300 rounded-lg border border-violet-500/30 text-[10px] font-black uppercase tracking-widest transition-all"
+                title="고른 구간을 조각으로 뜬다 (⌘/Ctrl+C)"
+              >
+                <Copy className="w-3.5 h-3.5" /> 복사
+              </button>
+              <button
+                onClick={handleCutRange}
+                disabled={!clipRegion && !selectedClipId}
+                className="h-8 px-2 flex items-center gap-1 bg-violet-500/10 hover:bg-violet-500/20 disabled:opacity-30 text-violet-300 rounded-lg border border-violet-500/30 text-[10px] font-black uppercase tracking-widest transition-all"
+                title="담고 나서 그 자리를 지운다 — 구간을 골랐으면 구간만, 아니면 클립 통째 (⌘/Ctrl+X)"
+              >
+                <Scissors className="w-3.5 h-3.5" /> 잘라내기
+              </button>
+              <button
+                onClick={handlePasteAtPlayhead}
+                disabled={!comp.clipboard}
+                className="h-8 px-2 flex items-center gap-1 bg-violet-500/10 hover:bg-violet-500/20 disabled:opacity-30 text-violet-300 rounded-lg border border-violet-500/30 text-[10px] font-black uppercase tracking-widest transition-all"
+                title={comp.clipboard ? `“${comp.clipboard.name}” 을 헤드 자리에 붙여넣는다 (⌘/Ctrl+V)` : '먼저 구간이나 클립을 복사하십시오 (⌘/Ctrl+C)'}
+              >
+                <ClipboardPaste className="w-3.5 h-3.5" /> 붙여넣기
+              </button>
+            </div>
+
+            {/* 자리 · 소리 다듬기 */}
+            <div className="flex items-center gap-1 rounded-lg bg-slate-950/50 border border-slate-800 px-1.5 py-1">
+              <button
+                onClick={handleRippleInsert}
+                className="h-8 px-2 flex items-center bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg border border-slate-700 text-[10px] font-black uppercase tracking-widest transition-all"
+                title={`재생 헤드 자리에 ${comp.silenceSec}초 만큼 빈 자리를 만든다 — 그 트랙에서 헤드 뒤의 클립이 통째로 밀린다. 길이는 병합 작업대의 “무음” 칸에서 바꾼다.`}
+              >
+                자리 {comp.silenceSec}초 벌리기
+              </button>
+              <button
+                onClick={handleRippleDelete}
+                disabled={!selectedClipId}
+                className="h-8 px-2 flex items-center bg-rose-500/10 hover:bg-rose-500/20 disabled:opacity-30 text-rose-300 rounded-lg border border-rose-500/30 text-[10px] font-black uppercase tracking-widest transition-all"
+                title="고른 클립을 트랙에서 빼고, 그 트랙의 뒤엣것을 당겨 빈 자리를 없앤다 — “자리 벌리기”의 반대다"
+              >
+                빼고 당기기
+              </button>
+            </div>
+
+            {/*
+              소리를 다듬는 것은 자리를 옮기는 것과 다른 일이라 묶음을 갈랐다.
+              한 묶음이던 때는 도크가 접힐 때 **묶음 한가운데가 잘려서** 음량
+              슬라이더만 윗줄에 남고 버튼이 아랫줄로 내려갔다. 이제는 접히더라도
+              뜻이 같은 것끼리 함께 내려간다.
+            */}
+            <div className="flex items-center gap-1 rounded-lg bg-slate-950/50 border border-slate-800 px-1.5 py-1">
+              <button
+                onClick={handleReverseAction}
+                disabled={!selectedClipId && !clipRegion}
+                className="h-8 px-2 flex items-center gap-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-slate-300 rounded-lg border border-slate-700 text-[10px] font-black uppercase tracking-widest transition-all"
+                title="앞뒤로 뒤집는다 — 구간을 골랐으면 그 구간만, 아니면 클립 통째로"
+              >
+                <FlipHorizontal className="w-3.5 h-3.5" /> 뒤집기
+              </button>
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="range" min={0} max={GAIN_MAX_PCT} step={1} value={gainPct}
+                  onChange={(e) => setGainPct(parseInt(e.target.value, 10))}
+                  className="w-20 h-8 accent-indigo-500 cursor-pointer"
+                  title="100% 가 원래 크기다 — 한 번에 200%(두 배, +6.02 dB)까지 걸린다. 더 키우려면 한 번 더 건다."
+                />
+                <span
+                  className={`w-10 text-right text-[10px] font-mono tabular-nums ${
+                    gainPct > 100 ? 'text-amber-400' : gainPct < 100 ? 'text-sky-400' : 'text-slate-500'
+                  }`}
+                  title="슬라이더와 dB 칸은 같은 값을 다르게 보여 준다"
+                >
+                  {gainPct}%
+                </span>
+                <input
+                  type="number" step={0.5} value={gainDb}
+                  onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v)) setGainDb(v); }}
+                  className="w-14 h-8 bg-slate-950 border border-slate-700 rounded-lg px-2 text-xs font-bold text-white tabular-nums focus:border-indigo-500 focus:outline-none"
+                  title="음수면 줄이고 양수면 키운다 — 슬라이더와 같은 값이다"
+                />
+                <button
+                  onClick={handleGainDbAction}
+                  disabled={(!selectedClipId && !clipRegion) || gainDb === 0}
+                  className="h-8 px-2 flex items-center bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-slate-300 rounded-lg border border-slate-700 text-[11px] font-black tracking-wide transition-all"
+                  title="고른 구간(없으면 클립 통째)의 음량을 이만큼 올리거나 내린다. 0 dB(100%)면 바뀔 것이 없어 눌리지 않는다."
+                >
+                  dB 걸기
+                </button>
+                {gainNotice && (
+                  <span
+                    className="text-[10px] font-mono text-amber-400 whitespace-nowrap"
+                    title="넘치지 않게 배수를 깎았다 — 파형을 자른 것이 아니다"
+                  >
+                    {gainNotice}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/*
+              구간을 골랐을 때만 나오는 묶음. 없을 때 자리를 차지할 이유가 없고,
+              고른 값이 바로 옆에 붙어 있어야 무엇에 거는지가 분명하다.
+            */}
+            {editRegion && (
+              <div className="flex items-center gap-1 rounded-lg bg-amber-500/10 border border-amber-500/30 px-1.5 py-1">
+                {selection && (
+                  <span className="text-[10px] font-mono text-amber-200/80 tabular-nums whitespace-nowrap shrink-0 px-1">
+                    T{selection.lane} {selection.start.toFixed(2)}–{selection.end.toFixed(2)}s
+                  </span>
+                )}
+                <button
+                  onClick={() => handleFadeAction('in')}
+                  className="h-8 px-2 flex items-center bg-slate-800/80 hover:bg-indigo-600 text-slate-300 hover:text-white rounded-lg border border-slate-700 text-[10px] font-black uppercase tracking-widest transition-all"
+                  title="구간을 페이드 인"
+                >
+                  페이드 인
+                </button>
+                <button
+                  onClick={() => handleFadeAction('out')}
+                  className="h-8 px-2 flex items-center bg-slate-800/80 hover:bg-indigo-600 text-slate-300 hover:text-white rounded-lg border border-slate-700 text-[10px] font-black uppercase tracking-widest transition-all"
+                  title="구간을 페이드 아웃"
+                >
+                  페이드 아웃
+                </button>
+                <button
+                  onClick={handleCropAction}
+                  className="h-8 px-2 flex items-center bg-violet-500/10 hover:bg-violet-500/20 text-violet-300 rounded-lg border border-violet-500/30 text-[10px] font-black uppercase tracking-widest transition-all"
+                  title="구간만 남긴다"
+                >
+                  구간만 남기기
+                </button>
+                <button
+                  onClick={handleCutAction}
+                  className="h-8 px-2 flex items-center bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 rounded-lg border border-rose-500/30 text-[10px] font-black uppercase tracking-widest transition-all"
+                  title="구간을 지운다"
+                >
+                  구간 지우기
+                </button>
+              </div>
+            )}
+
+            </div>
+
+            {/* 마무리 — 오른쪽에 못 박아 편집과 갈라 놓는다 */}
+            <div className="shrink-0 flex items-center gap-1 rounded-lg bg-slate-950/50 border border-slate-800 px-1.5 py-1">
+              <button
+                onClick={handleToggleMono}
+                disabled={audio.isProcessing || !editTargetClip || editTargetClip.buffer.numberOfChannels === 1}
+                className="h-8 px-2 flex items-center gap-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-slate-300 rounded-lg border border-slate-700 text-[10px] font-black uppercase tracking-widest transition-all"
+                title={editTargetClip && editTargetClip.buffer.numberOfChannels === 1 ? '이 클립은 이미 모노다' : '고른 클립을 2채널에서 1채널로 내린다 (효과음·말 상태음 규격)'}
+              >
+                <Merge className="w-3.5 h-3.5" /> 모노
+              </button>
+              <button
+                onClick={() => void bakeComposition()}
+                disabled={comp.clips.length === 0 || audio.isProcessing}
+                className="h-8 px-2 flex items-center gap-1 bg-violet-600 hover:bg-violet-500 disabled:opacity-30 text-white rounded-lg border border-violet-400 text-[10px] font-black uppercase tracking-widest transition-all"
+                title="트랙을 한 트랙으로 구워 아래 “합친 결과”에 놓는다. 마디 격자(Loop Lab)를 쓸 때 필요하고, 내보내기에는 필요 없다 — 내보내기는 트랙에서 바로 굽는다."
+              >
+                <Combine className="w-3.5 h-3.5" /> 합치기
+              </button>
+            </div>
+          </div>
         </div>
-        <span className="text-[9px] text-slate-700 font-bold uppercase tracking-[0.3em]">Hardware Accelerated Processing Node</span>
-        <div className="flex items-center gap-2 text-slate-600">
-           <span className="text-[9px] font-black uppercase tracking-[0.2em]">{audio.duration.toFixed(2)}s Cache</span>
-           <div className="w-1.5 h-1.5 rounded-full bg-slate-700"></div>
-        </div>
-      </footer>
+      )}
 
       <style>{`
         @keyframes pulse-subtle {
@@ -1210,5 +2347,8 @@ const App: React.FC = () => {
   );
 };
 
-const root = createRoot(document.getElementById('root')!);
-root.render(<App />);
+// HMR 로 이 모듈이 다시 실행돼도 같은 컨테이너에 루트를 두 번 만들지 않는다.
+// (index.html 이 index.tsx 를 두 번 걸고 있던 것도 2026-08-11 에 함께 고쳤다.)
+const w = window as unknown as { __pulselabRoot?: ReturnType<typeof createRoot> };
+w.__pulselabRoot ??= createRoot(document.getElementById('root')!);
+w.__pulselabRoot.render(<App />);
