@@ -119,8 +119,13 @@ interface Props {
   zoom: number;
   onZoomChange: (z: number) => void;
   /** 편집 대상. 자르기·페이드·게인이 이 클립에 걸린다. */
-  selectedClipId: string | null;
-  onSelectClip: (id: string) => void;
+  /** 고른 클립들. 첫 번째가 편집 대상(닻)이다. */
+  selectedIds: string[];
+  /**
+   * `range` 는 Shift — **같은 트랙 안에서** 닻부터 누른 것까지 한꺼번에 고른다.
+   * `toggle` 은 Cmd/Ctrl — 하나씩 넣고 뺀다. 그냥 누르면 `single`.
+   */
+  onSelectClip: (id: string, mode: 'single' | 'range' | 'toggle') => void;
   /** 트랙 위에서 고른 구간. 편집이 걸리는 자리다. */
   selection: TrackSelection | null;
   onSelectionChange: (sel: TrackSelection | null) => void;
@@ -135,7 +140,7 @@ export interface TrackSelection {
 
 const CompositionTimeline: React.FC<Props> = ({
   clips, crossfadeMs, minLanes, onChange, onBeginEdit, onAddLane, onRemoveLane, onMoveLane, onRemoveTrack, canRemoveLane,
-  currentTime, onSeek, zoom, onZoomChange, selectedClipId, onSelectClip, selection, onSelectionChange,
+  currentTime, onSeek, zoom, onZoomChange, selectedIds, onSelectClip, selection, onSelectionChange,
 }) => {
   /**
    * 왼쪽 끌기 하나로 옮기기와 구간 고르기를 다 할 수는 없다. 수정키로 가르면
@@ -602,17 +607,25 @@ const CompositionTimeline: React.FC<Props> = ({
               const bins = Math.round(widthPx);
               const chCount = Math.min(2, clip.buffer.numberOfChannels);
               const active = drag?.id === clip.id;
-              const selected = selectedClipId === clip.id;
+              const selected = selectedIds.includes(clip.id);
+              const isAnchor = selectedIds[0] === clip.id;
               return (
                 <div
                   key={clip.id}
-                  onPointerDown={(e) => { if (e.button === 0) onSelectClip(clip.id); beginClipDrag(e, clip); }}
-                  title={`${clip.name} — 눌러서 편집 대상으로, 왼쪽 끌기로 옮기기`}
+                  onPointerDown={(e) => {
+                    if (e.button === 0) {
+                      onSelectClip(clip.id, e.shiftKey ? 'range' : (e.metaKey || e.ctrlKey) ? 'toggle' : 'single');
+                    }
+                    beginClipDrag(e, clip);
+                  }}
+                  title={`${clip.name} — 눌러서 편집 대상으로, 왼쪽 끌기로 옮기기.\nShift+누르기: 같은 트랙에서 여기까지 한꺼번에. Cmd/Ctrl+누르기: 하나씩 넣고 빼기.`}
                   className={`absolute rounded-lg overflow-hidden cursor-grab active:cursor-grabbing transition-shadow ${
                     active
                       ? 'bg-sky-500/40 border-2 border-sky-300 shadow-lg shadow-sky-500/30 z-20'
                       : selected
-                        ? 'bg-sky-500/30 border-2 border-amber-400 shadow-lg shadow-amber-500/20 z-20'
+                        ? (isAnchor
+                            ? 'bg-sky-500/30 border-2 border-amber-400 shadow-lg shadow-amber-500/20 z-20'
+                            : 'bg-sky-500/25 border-2 border-amber-400/50 border-dashed z-20')
                         : 'bg-sky-600/25 border border-sky-500/50 hover:bg-sky-600/35 z-10'
                   }`}
                   style={{

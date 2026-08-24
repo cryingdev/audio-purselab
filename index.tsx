@@ -202,6 +202,39 @@ const App: React.FC = () => {
   const [currentPeak, setCurrentPeak] = useState<number | null>(null);
   /** 편집 대상 클립. 클립이 문서이므로 편집은 이 클립에 걸린다. */
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  /*
+   * 여럿 고르기. **닻(`selectedClipId`)은 그대로 두고 딸린 것만 따로 든다.**
+   * 편집은 늘 닻을 기준으로 걸리므로(구간 좌표도 닻에서 나온다) 이렇게 두면
+   * 하나만 골랐을 때의 동작이 한 줄도 안 바뀐다.
+   */
+  const [extraClipIds, setExtraClipIds] = useState<string[]>([]);
+  const selectedIds = useMemo(
+    () => (selectedClipId ? [selectedClipId, ...extraClipIds.filter(id => id !== selectedClipId)] : []),
+    [selectedClipId, extraClipIds]
+  );
+
+  /**
+   * Shift 는 **같은 트랙 안에서** 닻부터 누른 것까지 한꺼번에, Cmd/Ctrl 은 하나씩.
+   * 트랙이 다르면 범위가 뜻을 잃으므로 그냥 새로 고른 것으로 친다.
+   */
+  const handleSelectClip = (id: string, mode: 'single' | 'range' | 'toggle' = 'single') => {
+    if (mode === 'single' || !selectedClipId) { setSelectedClipId(id); setExtraClipIds([]); return; }
+    if (mode === 'toggle') {
+      if (id === selectedClipId) return;
+      setExtraClipIds(prev => (prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]));
+      return;
+    }
+    const anchor = comp.clips.find(c => c.id === selectedClipId);
+    const target = comp.clips.find(c => c.id === id);
+    if (!anchor || !target || anchor.lane !== target.lane) { setSelectedClipId(id); setExtraClipIds([]); return; }
+    const lo = Math.min(anchor.startSec, target.startSec);
+    const hi = Math.max(anchor.startSec, target.startSec);
+    setExtraClipIds(
+      comp.clips
+        .filter(c => c.lane === anchor.lane && c.startSec >= lo - 1e-9 && c.startSec <= hi + 1e-9 && c.id !== selectedClipId)
+        .map(c => c.id)
+    );
+  };
 
   /**
    * 줌은 하나다. **1× 이 "폭에 맞춤"** 이고, 트랙 파형과 아래 `합친 결과` 가
@@ -638,6 +671,7 @@ const App: React.FC = () => {
     }));
     setSelection(null);
     setSelectedClipId(null);
+    setExtraClipIds([]);
     setExportName('');
     setZoomFactor(1);
     setActiveRegion(null);
@@ -669,6 +703,41 @@ const App: React.FC = () => {
       const clip = editTargetClip;
       if (!clip) {
         showNotice('편집할 클립을 고르십시오 — 트랙에서 클립을 누르거나 구간을 그으면 됩니다.');
+        return;
+      }
+      /*
+       * 여럿 골랐고 **구간을 안 그었으면** 고른 것 전부에 건다.
+       * 구간을 그었을 때는 그 좌표가 닻 하나에서만 뜻이 있으므로 닻에만 건다 —
+       * 다른 클립의 같은 시각은 전혀 다른 자리다.
+       */
+      const targets = !editRegion && selectedIds.length > 1
+        ? comp.clips.filter(c => selectedIds.includes(c.id))
+        : [clip];
+      if (targets.length > 1) {
+        setAudio(prev => ({ ...prev, isProcessing: true, processingMsg: `${msg} (${targets.length}개)` }));
+        try {
+          const ctx = makeContext();
+          const next = new Map<string, AudioBuffer>();
+          for (const t of targets) {
+            const copy = ctx.createBuffer(t.buffer.numberOfChannels, t.buffer.length, t.buffer.sampleRate);
+            for (let c = 0; c < t.buffer.numberOfChannels; c++) copy.getChannelData(c).set(t.buffer.getChannelData(c));
+            const out = await processor(copy, ctx);
+            if (out) next.set(t.id, out);
+          }
+          void ctx.close();
+          if (next.size > 0) {
+            setComp(prev => ({
+              ...prev,
+              undo: [...prev.undo, prev.clips].slice(-30),
+              redo: [],
+              clips: prev.clips.map(c => (next.has(c.id) ? { ...c, buffer: next.get(c.id)! } : c)),
+            }));
+            showNotice(`클립 ${next.size}개에 걸었습니다.`);
+          }
+        } catch (e) {
+          console.error('Multi clip processing failed', e);
+        }
+        setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
         return;
       }
       setAudio(prev => ({ ...prev, isProcessing: true, processingMsg: msg }));
@@ -1129,14 +1198,24 @@ const App: React.FC = () => {
   };
 
   /** 고른 클립을 빼고 그 트랙의 틈을 닫는다. */
+  /* 구간을 그으면 여럿 고르기는 뜻을 잃는다 — 그 시각은 닻에서만 뜻이 있다. */
+  useEffect(() => { if (selection) setExtraClipIds([]); }, [selection?.lane, selection?.start, selection?.end]);
+
   const handleRippleDelete = () => {
-    const clip = comp.clips.find(c => c.id === selectedClipId);
-    if (!clip) {
+    const doomed = comp.clips.filter(c => selectedIds.includes(c.id));
+    if (doomed.length === 0) {
       showNotice('뺄 클립을 먼저 고르십시오.');
       return;
     }
-    commitClips(rippleDelete(comp.clips, clip.id));
+    // 뒤엣것부터 빼야 앞의 자리가 안 흔들린다 — 앞부터 빼면 뒤 클립이 당겨와 자리가 바뀐다.
+    const order = [...doomed].sort((a, b) => b.startSec - a.startSec);
+    let next = comp.clips;
+    for (const c of order) next = rippleDelete(next, c.id);
+    commitClips(next);
     setSelection(null);
+    setSelectedClipId(null);
+    setExtraClipIds([]);
+    if (doomed.length > 1) showNotice(`클립 ${doomed.length}개를 빼고 당겼습니다.`);
   };
 
   /**
@@ -1291,7 +1370,15 @@ const App: React.FC = () => {
   };
 
   /** 전부 합쳐 한 트랙으로 굽고 편집기로 넘긴다. */
-  const bakeComposition = async (clips: CompClip[] = comp.clips) => {
+  /**
+   * 클립을 한 트랙으로 굽는다.
+   *
+   * `collapse` 를 주면 **파형도 한 트랙으로 접는다** — 구운 결과를 클립 하나로
+   * 삼아 트랙 0 에 놓고 나머지를 치운다. 전에는 아래 `합친 결과` 에만 놓았는데,
+   * 그 화면은 단계에 따라 안 보일 때가 있어서 **누르고도 아무 일이 없는 것처럼
+   * 보였다.** 문서(클립)가 바뀌어야 눌린 티가 난다. 되돌리기로 살릴 수 있다.
+   */
+  const bakeComposition = async (clips: CompClip[] = comp.clips, collapse = false) => {
     if (clips.length === 0) return;
     setAudio(prev => ({ ...prev, isProcessing: true, processingMsg: '클립 합치는 중…' }));
     try {
@@ -1319,7 +1406,24 @@ const App: React.FC = () => {
       const url = URL.createObjectURL(blob);
       const oldUrl = audio.currentUrl;
 
-      setComp(prev => ({ ...prev, lastPeak: rawPeak }));
+      if (collapse) {
+        const name = clips.length > 1 ? `합친 ${clips.length}개` : clips[0].name;
+        setComp(prev => ({
+          ...prev,
+          lastPeak: rawPeak,
+          undo: [...prev.undo, prev.clips].slice(-30),
+          redo: [],
+          clips: [{
+            id: newClipId(), name, buffer: rendered!,
+            lane: 0, startSec: 0, gain: 1, fadeInMs: 0, fadeOutMs: 0,
+          }],
+          minLanes: 1,
+        }));
+        setSelection(null);
+        setSelectedClipId(null);
+      } else {
+        setComp(prev => ({ ...prev, lastPeak: rawPeak }));
+      }
       setAudio(prev => ({
         ...prev,
         currentUrl: url,
@@ -1336,6 +1440,9 @@ const App: React.FC = () => {
         sourceKind: prev.sourceKind ?? 'audio',
       }));
       setActiveRegion(null);
+      if (collapse) {
+        showNotice(`트랙 ${clips.length}개를 한 트랙으로 합쳤습니다 — ${rendered!.duration.toFixed(3)}초 · ${rendered!.numberOfChannels === 1 ? '모노' : '스테레오'}. 되돌리기로 되살릴 수 있습니다.`);
+      }
     } catch (e) {
       console.error('Composition failed', e);
       setAudio(prev => ({ ...prev, isProcessing: false, processingMsg: '' }));
@@ -2050,8 +2157,8 @@ const App: React.FC = () => {
                       onSeek={playback.seek}
                       zoom={zoomFactor}
                       onZoomChange={setZoomFactor}
-                      selectedClipId={selectedClipId}
-                      onSelectClip={setSelectedClipId}
+                      selectedIds={selectedIds}
+                      onSelectClip={handleSelectClip}
                       selection={selection}
                       onSelectionChange={handleSelectionChange}
                     />
@@ -2069,7 +2176,7 @@ const App: React.FC = () => {
                 마디 격자가 나오는 단계(다듬기·내보내기)에서, 그마저 펴 두었을 때만
                 띄운다. 담고 놓는 동안에는 130 px 을 돌려받는다.
               */}
-              {loopLabOpen && (stage === '다듬기' || stage === '내보내기') && (
+              {(stage === '내보내기' || (loopLabOpen && stage === '다듬기')) && (
               <div className="relative group mt-6">
                 <div className="absolute top-3 right-4 z-10 flex items-center gap-2">
                    <div className="bg-black/60 backdrop-blur-md px-3 py-1 rounded-full border border-white/5 text-[9px] font-bold text-slate-500 uppercase">
@@ -2534,6 +2641,14 @@ const App: React.FC = () => {
               >
                 자리 {comp.silenceSec}초 벌리기
               </button>
+              {selectedIds.length > 1 && (
+                <span
+                  className="text-[10px] font-mono text-amber-300 tabular-nums whitespace-nowrap px-1"
+                  title="Shift+누르기로 같은 트랙에서 범위를, Cmd/Ctrl+누르기로 하나씩 고릅니다. 구간을 안 그었으면 편집이 고른 것 전부에 걸립니다."
+                >
+                  {selectedIds.length}개
+                </span>
+              )}
               <button
                 onClick={handleRippleDelete}
                 disabled={!selectedClipId}
@@ -2649,10 +2764,10 @@ const App: React.FC = () => {
                 <Merge className="w-3.5 h-3.5" /> 모노
               </button>
               <button
-                onClick={() => void bakeComposition()}
-                disabled={comp.clips.length === 0 || audio.isProcessing}
+                onClick={() => void bakeComposition(comp.clips, true)}
+                disabled={comp.clips.length <= 0 || audio.isProcessing}
                 className="h-8 px-2 flex items-center gap-1 bg-violet-600 hover:bg-violet-500 disabled:opacity-30 text-white rounded-lg border border-violet-400 text-[10px] font-black uppercase tracking-widest transition-all"
-                title="트랙을 한 트랙으로 구워 아래 “합친 결과”에 놓는다. 마디 격자(Loop Lab)를 쓸 때 필요하고, 내보내기에는 필요 없다 — 내보내기는 트랙에서 바로 굽는다."
+                title="트랙을 통째로 구워 **한 트랙**으로 접는다. 파형도 클립 하나가 되고, 되돌리기로 되살릴 수 있다."
               >
                 <Combine className="w-3.5 h-3.5" /> 합치기
               </button>
