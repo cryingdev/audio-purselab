@@ -279,6 +279,20 @@ const App: React.FC = () => {
     setGainDb(pct <= 0 ? -100 : Math.round(20 * Math.log10(pct / 100) * 100) / 100);
   /** 병합 작업대도 접힌다 — 한 번 정해 두면 자주 안 만지는 설정과 클립 목록이다. */
   const [mergePanelOpen, setMergePanelOpen] = useState(true);
+
+  /*
+   * 편집면을 **작업 단계**로 가른다.
+   *
+   * 한 카드에 묶음 여섯이 붙어 있었다 — 담을 때 설정, 붙이는 곳, 무음 담기,
+   * 길이 바꾸기, 잔 소리, 이음매·굽기. 하는 일의 **때가 다른 것들**이라
+   * 서로 섞여 있으면 지금 무엇을 해야 하는지가 안 보이고, 넓은 화면에서도
+   * 두 줄로 접혀 파형이 밀려났다.
+   *
+   * 단계는 순서가 있다: 담고 → 놓고 → 다듬고 → 낸다. 그 순서대로 늘어놓는다.
+   */
+  const STAGES = ['담기', '배치', '다듬기', '내보내기'] as const;
+  type Stage = (typeof STAGES)[number];
+  const [stage, setStage] = useState<Stage>('배치');
   /**
    * 도크가 실제로 차지하는 높이. 좁은 화면에서는 두세 줄로 접혀 135 px 까지 커지는데
    * 비워 두는 자리를 128 px 로 **고정해 뒀더니 아래 내용이 가려졌다.** 재서 그만큼 비운다.
@@ -1839,10 +1853,47 @@ const App: React.FC = () => {
               </div>
 
               {/*
+                작업 단계 띠. **화면 전체의 조직자**라 맨 위에 둔다 — 카드 안에 두면
+                자기 카드밖에 못 다스리는데, 마디 격자는 파형 위에 따로 있어서
+                그 카드 안의 띠로는 손이 안 닿는다.
+
+                단계는 순서가 있다: 담고 → 놓고 → 다듬고 → 낸다.
+              */}
+              {composing && (
+                <div className="flex items-center gap-1 rounded-2xl bg-slate-900/60 border border-slate-800 p-1.5 mb-6 w-fit">
+                  {STAGES.map((st, i) => (
+                    <React.Fragment key={st}>
+                      {i > 0 && <span className="text-slate-700 text-xs px-0.5">›</span>}
+                      <button
+                        onClick={() => setStage(st)}
+                        aria-pressed={stage === st}
+                        className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${
+                          stage === st
+                            ? 'bg-sky-600 text-white shadow-lg shadow-sky-600/20'
+                            : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+                        }`}
+                        title={{
+                          담기: '파일을 가져와 트랙에 얹는다. 담자마자 할 손질도 여기서 정한다.',
+                          배치: '어느 트랙 어디에 놓을지. 무음으로 길이를 늘리는 것도 배치다.',
+                          다듬기: '소리 자체를 손본다 — 길이·잔 소리·마디 격자·루프.',
+                          내보내기: '이음매와 규격을 정해 한 파일로 낸다.',
+                        }[st]}
+                      >
+                        {st}
+                      </button>
+                    </React.Fragment>
+                  ))}
+                </div>
+              )}
+
+              {/*
                 마디 격자는 음악 루프를 만들 때만 쓴다 — 환경음·효과음 작업에서는
                 자리만 차지하므로 접어 둘 수 있게 했고, 파형 **위**로 올려
                 아래까지 스크롤하지 않아도 손이 닿게 했다.
+                마디 격자와 루프 만들기는 **다듬기**, 규격 맞추기는 **내보내기** 단계의 일이다.
+                담고 놓는 동안에는 자리만 차지하므로 아예 안 보인다.
               */}
+              {(stage === '다듬기' || stage === '내보내기') && (
               <div className="bg-slate-900/60 border border-emerald-800/40 rounded-[28px] px-6 py-4 shadow-xl backdrop-blur-md mb-6">
                 <div className={`flex items-center justify-between ${loopLabOpen ? 'mb-5' : ''}`}>
                   <button
@@ -1860,7 +1911,7 @@ const App: React.FC = () => {
 
                 {loopLabOpen && (<>
                 <div className="flex flex-wrap items-stretch gap-3">
-                  {group('격자 잡기', 'text-emerald-500/70', <>
+                  {stage === '다듬기' && group('격자 잡기', 'text-emerald-500/70', <>
                     {numField('BPM', loop.bpm, v => setLoop(p => ({ ...p, bpm: Math.max(1, v) })), { step: 0.1 })}
                     {numField('박자/마디', loop.beatsPerBar, v => setLoop(p => ({ ...p, beatsPerBar: Math.max(1, Math.round(v)) })), { width: 'w-16' })}
                     {numField('다운비트', loop.downbeat, v => setLoop(p => ({ ...p, downbeat: Math.max(0, v) })), { step: 0.001, suffix: 's', width: 'w-24' })}
@@ -1874,7 +1925,7 @@ const App: React.FC = () => {
                     </button>
                   </>)}
 
-                  {group('구간 고르기', 'text-emerald-500/70', <>
+                  {stage === '다듬기' && group('구간 고르기', 'text-emerald-500/70', <>
                     {numField('마디 수', loop.bars, v => setLoop(p => ({ ...p, bars: Math.max(1, Math.round(v)) })), { width: 'w-20' })}
                     <button
                       onClick={handleSelectBars}
@@ -1893,7 +1944,7 @@ const App: React.FC = () => {
                     </button>
                   </>)}
 
-                  {group('루프 만들기', 'text-emerald-500/70', <>
+                  {stage === '다듬기' && group('루프 만들기', 'text-emerald-500/70', <>
                     <button
                       onClick={toggleLoopPreview}
                       disabled={!readoutRegion}
@@ -1929,7 +1980,7 @@ const App: React.FC = () => {
                     </button>
                   </>)}
 
-                  {group('규격 맞추기', 'text-amber-500/70', <>
+                  {stage === '내보내기' && group('규격 맞추기', 'text-amber-500/70', <>
                     {numField('목표 피크', loop.targetDbfs, v => setLoop(p => ({ ...p, targetDbfs: v })), { step: 0.5, suffix: 'dBFS', width: 'w-20' })}
                     <button
                       onClick={handleNormalizeToTargetAction}
@@ -1959,6 +2010,7 @@ const App: React.FC = () => {
                 </div>
                 </>)}
               </div>
+              )}
 
               {/*
                 Interactive Layer — 트랙이 편집점이다.
@@ -2014,9 +2066,10 @@ const App: React.FC = () => {
               */}
               {/*
                 합친 결과는 마디 격자를 쓸 때만 필요하다 — 이름에도 그렇게 적혀 있다.
-                Loop Lab 과 함께 접어 두면 평소에 130 px 을 돌려받는다.
+                마디 격자가 나오는 단계(다듬기·내보내기)에서, 그마저 펴 두었을 때만
+                띄운다. 담고 놓는 동안에는 130 px 을 돌려받는다.
               */}
-              {loopLabOpen && (
+              {loopLabOpen && (stage === '다듬기' || stage === '내보내기') && (
               <div className="relative group mt-6">
                 <div className="absolute top-3 right-4 z-10 flex items-center gap-2">
                    <div className="bg-black/60 backdrop-blur-md px-3 py-1 rounded-full border border-white/5 text-[9px] font-bold text-slate-500 uppercase">
@@ -2045,7 +2098,7 @@ const App: React.FC = () => {
                     className="flex items-center gap-2 text-[10px] font-black text-sky-400 uppercase tracking-widest hover:text-sky-300 transition-colors"
                     title={mergePanelOpen ? '병합 작업대 접기' : '병합 작업대 펴기'}
                   >
-                    <Layers className="w-3.5 h-3.5" /> 병합 작업대 · 클립 {comp.clips.length}개
+                    <Layers className="w-3.5 h-3.5" /> 편집 · 클립 {comp.clips.length}개
                     <span className="text-slate-500">{mergePanelOpen ? '▾' : '▸'}</span>
                   </button>
                   <div className="text-[10px] font-mono text-slate-500">
@@ -2057,7 +2110,7 @@ const App: React.FC = () => {
 
                 {mergePanelOpen && (<>
                 <div className="flex flex-wrap items-stretch gap-3 mb-5">
-                  {group('같은 트랙에 이어 붙이기', 'text-sky-500/70', <>
+                  {stage === '담기' && group('같은 트랙에 이어 붙이기', 'text-sky-500/70', <>
                     <label
                       className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-xl border border-sky-400 text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer"
                       title="트랙 0 뒤에 이음매를 겹쳐 이어 붙인다 (길이가 늘어난다). 위쪽 “트랙 추가”는 새 트랙에 나란히 얹는다."
@@ -2084,7 +2137,7 @@ const App: React.FC = () => {
 
                   {/* 빈 트랙 +/− 는 타임라인의 `새 트랙` 줄로 옮겼다 — 트랙을 보고 있는
                       자리에 두는 편이 낫고, 같은 버튼이 두 군데 있으면 어느 쪽이 진짜인지 헷갈린다. */}
-                  {group('길이 늘리기', 'text-sky-500/70', <>
+                  {stage === '배치' && group('길이 늘리기', 'text-sky-500/70', <>
                     {numField('무음', comp.silenceSec, v => setComp(p => ({ ...p, silenceSec: Math.max(0.001, v) })), { step: 0.5, suffix: 's', width: 'w-20' })}
                     <button
                       onClick={handleAddSilence}
@@ -2097,7 +2150,7 @@ const App: React.FC = () => {
                   </>)}
 
                   {/* 자르기·끼워넣기와 굽기 버튼은 화면 아래 도크에 있다 — 같은 것을 두 군데 두지 않는다. */}
-                  {group('이음매 · 굽기 (내보내기에도 적용)', 'text-sky-500/70', <>
+                  {stage === '내보내기' && group('이음매 · 굽기 (내보내기에도 적용)', 'text-sky-500/70', <>
                     {numField('크로스페이드', comp.crossfadeMs, v => setComp(p => ({ ...p, crossfadeMs: Math.max(0, v) })), { suffix: 'ms', width: 'w-24' })}
                     {numField('끝→시작 말기', comp.wrapMs, v => setComp(p => ({ ...p, wrapMs: Math.max(0, v) })), { suffix: 'ms', width: 'w-24' })}
                     <Switch
@@ -2119,7 +2172,7 @@ const App: React.FC = () => {
                     어긋나 있어서(조용하고, 스테레오 그릇에 모노가 담겨 온다)
                     담을 때마다 손으로 두 번 누르게 된다.
                   */}
-                  {group('담을 때', 'text-sky-400/70', <>
+                  {stage === '담기' && group('담을 때', 'text-sky-400/70', <>
                     <Switch
                       checked={autoNormalize}
                       onChange={setAutoNormalize}
@@ -2146,7 +2199,7 @@ const App: React.FC = () => {
                     7.70초짜리를 8.00초(120 BPM 4마디)로 늘려 격자에 맞추면
                     내용을 하나도 안 버리고 루프가 박자에 맞는다.
                   */}
-                  {group('길이 바꾸기', 'text-emerald-500/70', <>
+                  {stage === '다듬기' && group('길이 바꾸기', 'text-emerald-500/70', <>
                     {numField('목표 길이', targetLenSec, v => setTargetLenSec(Math.max(0, v)), { step: 0.1, suffix: 's', width: 'w-24' })}
                     <button
                       onClick={snapLenToBar}
@@ -2227,7 +2280,7 @@ const App: React.FC = () => {
                     어택·릴리스가 없어 문턱 아래를 표본마다 0 으로 떨군다.
                     디지털 무음을 자르는 데만 쓰고, 게이트로 쓰면 지퍼 노이즈가 난다.
                   */}
-                  {group('잔 소리 다듬기', 'text-slate-500', <>
+                  {stage === '다듬기' && group('잔 소리 다듬기', 'text-slate-500', <>
                     <Knob
                       label="문턱값"
                       value={audio.gateThreshold} min={0.001} max={0.1} step={0.001} resetTo={0.005}
@@ -2251,8 +2304,11 @@ const App: React.FC = () => {
 
                 {/* 트랙별 파형은 위 Interactive Layer 로 올라갔다. 여기는 정확한 값과 합치기 설정 몫이다. */}
 
-                {/* 클립 목록 — 정확한 값은 여기서 넣는다 */}
-                {comp.clips.length > 0 && (
+                {/*
+                  클립 목록 — 정확한 값은 여기서 넣는다. **배치 단계의 몫**이다.
+                  늘 펴 두었더니 클립이 늘어날수록 다른 단계에서도 화면을 밀어냈다.
+                */}
+                {stage === '배치' && comp.clips.length > 0 && (
                   <div className="border-t border-slate-800 pt-4 mt-4 flex flex-col gap-2">
                     {comp.clips.map((c) => (
                       <div key={c.id} className="flex flex-wrap items-center gap-3 bg-slate-950/60 border border-slate-800 rounded-xl px-3 py-2">
