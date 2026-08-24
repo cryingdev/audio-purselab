@@ -92,6 +92,7 @@ import {
 import CompositionTimeline, { TrackSelection } from './CompositionTimeline';
 import { useCompositionPlayback } from './useCompositionPlayback';
 import { Knob } from './Knob';
+import { Switch } from './Switch';
 
 // --- Types ---
 
@@ -2099,20 +2100,13 @@ const App: React.FC = () => {
                   {group('이음매 · 굽기 (내보내기에도 적용)', 'text-sky-500/70', <>
                     {numField('크로스페이드', comp.crossfadeMs, v => setComp(p => ({ ...p, crossfadeMs: Math.max(0, v) })), { suffix: 'ms', width: 'w-24' })}
                     {numField('끝→시작 말기', comp.wrapMs, v => setComp(p => ({ ...p, wrapMs: Math.max(0, v) })), { suffix: 'ms', width: 'w-24' })}
-                    <label
-                      className="flex items-center gap-2 px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl cursor-pointer"
+                    <Switch
+                      checked={comp.normalizeAfter}
+                      onChange={(v) => setComp(p => ({ ...p, normalizeAfter: v }))}
+                      label={`${loop.targetDbfs} dBFS 로 맞춤`}
+                      accent="#fbbf24"
                       title={`피크를 ${loop.targetDbfs} dBFS 로 맞춘다. 내보낼 때도 똑같이 걸린다.`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={comp.normalizeAfter}
-                        onChange={(e) => setComp(p => ({ ...p, normalizeAfter: e.target.checked }))}
-                        className="accent-amber-500"
-                      />
-                      <span className="text-[10px] font-black text-amber-400 tracking-widest whitespace-nowrap">
-                        {loop.targetDbfs} dBFS 로 맞춤
-                      </span>
-                    </label>
+                    />
                   </>)}
 
                   {/*
@@ -2126,28 +2120,24 @@ const App: React.FC = () => {
                     담을 때마다 손으로 두 번 누르게 된다.
                   */}
                   {group('담을 때', 'text-sky-400/70', <>
-                    <label
-                      className="flex items-center gap-2 px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl cursor-pointer"
+                    <Switch
+                      checked={autoNormalize}
+                      onChange={setAutoNormalize}
+                      label={`${loop.targetDbfs} dBFS 로 맞추기`}
+                      accent="#38bdf8"
                       title={`담자마자 피크를 ${loop.targetDbfs} dBFS 로 맞춘다. Veo 클립은 -20 dBFS 언저리로 오는 일이 흔하다 — 실측한 낟알 붓는 소리는 -25.12 dBFS 였다.`}
-                    >
-                      <input type="checkbox" checked={autoNormalize} onChange={(e) => setAutoNormalize(e.target.checked)} className="accent-sky-500" />
-                      <span className="text-[10px] font-black text-sky-300 tracking-widest whitespace-nowrap">
-                        {loop.targetDbfs} dBFS 로 맞추기
-                      </span>
-                    </label>
-                    <label
-                      className="flex items-center gap-2 px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl cursor-pointer"
+                    />
+                    <Switch
+                      checked={autoMono}
+                      onChange={setAutoMono}
+                      label="좌우 같으면 모노로"
+                      accent="#38bdf8"
                       title={
                         '좌우가 사실상 같은 스테레오만 1채널로 내린다 (차이 ' + MONO_IDENTICAL_THRESHOLD + ' 미만).\n' +
                         '파형이 그대로라 잃는 것이 없고 파일이 절반이 된다.\n' +
                         '진짜 스테레오는 이 값의 백 배쯤 나오므로 음악·환경음은 안 건드린다 — 규격이 스테레오다.'
                       }
-                    >
-                      <input type="checkbox" checked={autoMono} onChange={(e) => setAutoMono(e.target.checked)} className="accent-sky-500" />
-                      <span className="text-[10px] font-black text-sky-300 tracking-widest whitespace-nowrap">
-                        좌우 같으면 모노로
-                      </span>
-                    </label>
+                    />
                   </>)}
 
                   {/*
@@ -2166,20 +2156,13 @@ const App: React.FC = () => {
                     >
                       <Grid3x3 className="w-3.5 h-3.5" /> 마디 스냅
                     </button>
-                    <label
-                      className="flex items-center gap-2 px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl cursor-pointer"
+                    <Switch
+                      checked={keepPitch}
+                      onChange={setKeepPitch}
+                      label="음정 유지"
+                      accent="#34d399"
                       title="켜면 음정을 지키며 길이만 바꾼다(조각을 겹쳐 붙인다). 끄면 테이프를 빨리 돌리듯 음정도 함께 바뀐다 — 정확하고 빠르다."
-                    >
-                      <input
-                        type="checkbox"
-                        checked={keepPitch}
-                        onChange={(e) => setKeepPitch(e.target.checked)}
-                        className="accent-emerald-500"
-                      />
-                      <span className="text-[10px] font-black text-emerald-400 tracking-widest whitespace-nowrap">
-                        음정 유지
-                      </span>
-                    </label>
+                    />
                     {/*
                       조각 길이는 **음정 유지일 때만** 뜻이 있다. 속도 바꾸기는
                       겹쳐 붙이지 않으므로 이 값을 안 쓴다 — 안 쓰는 칸을 띄워 두면
