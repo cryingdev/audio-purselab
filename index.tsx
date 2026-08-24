@@ -91,6 +91,7 @@ import {
 } from './composer';
 import CompositionTimeline, { TrackSelection } from './CompositionTimeline';
 import { useCompositionPlayback } from './useCompositionPlayback';
+import { Knob } from './Knob';
 
 // --- Types ---
 
@@ -1504,12 +1505,6 @@ const App: React.FC = () => {
     document.body.removeChild(link);
   };
 
-  const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = parseFloat(e.target.value);
-    setAudio(prev => ({ ...prev, volume: val }));
-    wavesurferRef.current?.setVolume(val);
-  };
-
   // 끌어다 놓는 것도 버튼과 같은 뜻이다 — 지금 것을 버리지 않고 트랙으로 더한다.
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -2191,21 +2186,18 @@ const App: React.FC = () => {
                       켜고 끌 때마다 무엇이 살아 있는지 헷갈린다.
                     */}
                     {keepPitch && (
-                      <label className="flex flex-col gap-1">
-                        <span className="text-[9px] font-black text-slate-500 tracking-widest px-1">
-                          조각 {stretchFrameMs} ms
-                          <span className="ml-1 font-mono text-slate-600">
-                            ≥{Math.round(1000 / stretchFrameMs)} Hz
-                          </span>
-                        </span>
-                        <input
-                          type="range"
+                      <div className="flex items-end">
+                        <Knob
+                          label="조각"
+                          value={stretchFrameMs}
                           min={TIME_STRETCH_FRAME_MS_MIN}
                           max={TIME_STRETCH_FRAME_MS_MAX}
                           step={1}
-                          value={stretchFrameMs}
-                          onChange={(e) => setStretchFrameMs(parseInt(e.target.value, 10))}
-                          className="w-28 accent-emerald-500 cursor-pointer"
+                          resetTo={TIME_STRETCH_FRAME_MS_DEFAULT}
+                          onChange={setStretchFrameMs}
+                          size={38}
+                          accent="#34d399"
+                          format={(v) => `${v} ms · ≥${Math.round(1000 / v)} Hz`}
                           title={
                             '겹쳐 붙일 조각의 길이. 자료가 정한다.\n' +
                             '• 조각이 한 주기보다 짧으면 그 저역이 통째로 사라진다 — 5 ms 는 50 Hz 를 40 dB 죽인다.\n' +
@@ -2214,7 +2206,7 @@ const App: React.FC = () => {
                             '기본 20 ms 는 50 Hz 까지 담는다. 더 깊은 럼블이면 40~60 ms 로 올린다.'
                           }
                         />
-                      </label>
+                      </div>
                     )}
                     <button
                       onClick={handleLengthAction}
@@ -2253,19 +2245,15 @@ const App: React.FC = () => {
                     디지털 무음을 자르는 데만 쓰고, 게이트로 쓰면 지퍼 노이즈가 난다.
                   */}
                   {group('잔 소리 다듬기', 'text-slate-500', <>
-                    <label className="flex flex-col gap-1">
-                      <span className="text-[9px] font-black text-slate-500 tracking-widest px-1">
-                        문턱값 {(audio.gateThreshold * 100).toFixed(1)}%
-                      </span>
-                      <input
-                        type="range"
-                        min="0.001" max="0.1" step="0.001"
-                        value={audio.gateThreshold}
-                        onChange={(e) => setAudio(prev => ({ ...prev, gateThreshold: parseFloat(e.target.value) }))}
-                        className="w-28 accent-indigo-500 cursor-pointer"
-                        title="이 크기 아래의 표본을 0 으로 떨군다 — 디지털 무음을 자르는 용도다"
-                      />
-                    </label>
+                    <Knob
+                      label="문턱값"
+                      value={audio.gateThreshold} min={0.001} max={0.1} step={0.001} resetTo={0.005}
+                      onChange={(v) => setAudio(prev => ({ ...prev, gateThreshold: v }))}
+                      size={38}
+                      accent="#818cf8"
+                      format={(v) => `${(v * 100).toFixed(1)}%`}
+                      title="이 크기 아래의 표본을 0 으로 떨군다 — 디지털 무음을 자르는 용도다. 위아래로 끌거나 휠, 화살표 키."
+                    />
                     <button
                       onClick={handleDenoiseAction}
                       disabled={audio.isProcessing}
@@ -2450,12 +2438,16 @@ const App: React.FC = () => {
               >
                 <Repeat className="w-3.5 h-3.5" /> {loop.previewLooping ? '반복 중' : '반복'}
               </button>
-              <input
-                type="range" min="0" max="1" step="0.01"
-                value={audio.volume}
-                onChange={handleVolumeChange}
-                className="w-12 shrink-0 accent-indigo-500 h-1.5 bg-slate-800 rounded-full appearance-none cursor-pointer"
-                title="듣기 볼륨 (내보내는 파일과는 무관하다)"
+              <Knob
+                ariaLabel="듣기 볼륨"
+                value={audio.volume} min={0} max={1} step={0.01} resetTo={1}
+                onChange={(v) => {
+                  setAudio(prev => ({ ...prev, volume: v }));
+                  wavesurferRef.current?.setVolume(v);
+                }}
+                size={26}
+                accent="#818cf8"
+                title="듣기 볼륨 — 내보내는 파일과는 무관하다. 두 번 누르면 최대로."
               />
             </div>
 
@@ -2529,20 +2521,15 @@ const App: React.FC = () => {
                 <FlipHorizontal className="w-3.5 h-3.5" /> 뒤집기
               </button>
               <div className="flex items-center gap-1.5">
-                <input
-                  type="range" min={0} max={GAIN_MAX_PCT} step={1} value={gainPct}
-                  onChange={(e) => setGainPct(parseInt(e.target.value, 10))}
-                  className="w-20 h-8 accent-indigo-500 cursor-pointer"
-                  title="100% 가 원래 크기다 — 한 번에 200%(두 배, +6.02 dB)까지 걸린다. 더 키우려면 한 번 더 건다."
+                <Knob
+                  ariaLabel="음량"
+                  value={gainPct} min={0} max={GAIN_MAX_PCT} step={1} resetTo={100}
+                  onChange={setGainPct}
+                  size={30}
+                  accent={gainPct > 100 ? '#fbbf24' : gainPct < 100 ? '#38bdf8' : '#64748b'}
+                  format={(v) => `${v}%`}
+                  title="음량. 100% 가 원래 크기다 — 한 번에 200%(두 배, +6.02 dB)까지 걸린다. 위아래로 끌거나 휠, 화살표 키. 두 번 누르면 100% 로."
                 />
-                <span
-                  className={`w-10 text-right text-[10px] font-mono tabular-nums ${
-                    gainPct > 100 ? 'text-amber-400' : gainPct < 100 ? 'text-sky-400' : 'text-slate-500'
-                  }`}
-                  title="슬라이더와 dB 칸은 같은 값을 다르게 보여 준다"
-                >
-                  {gainPct}%
-                </span>
                 <input
                   type="number" step={0.5} value={gainDb}
                   onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v)) setGainDb(v); }}
