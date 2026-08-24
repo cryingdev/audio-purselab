@@ -523,6 +523,68 @@ export function applyReverse(buffer: AudioBuffer, start?: number, end?: number):
   return buffer;
 }
 
+/**
+ * 공간음(잔향)을 눌러 내리는 **다운워드 익스팬더**.
+ *
+ * 잔향은 타격 뒤에 남는 감쇠부다. 소리가 클 때는 손대지 않고 **문턱 아래로
+ * 내려간 만큼을 비율만큼 더 눌러** 내리면 꼬리가 짧아지고 방이 물러난다.
+ *
+ * 게이트(`applyNoiseGate`)와 무엇이 다른가: 게이트는 문턱 아래를 표본마다
+ * **0 으로 떨군다.** 어택·릴리스가 없어 꼬리가 뚝 끊기고 지퍼 노이즈가 난다.
+ * 익스팬더는 0 으로 떨구지 않고 **비율만큼** 내리며, 그 변화도 시간을 두고
+ * 움직인다. 그래서 잔향에 걸 수 있다.
+ *
+ *   문턱(`thresholdDb`)  — 이 아래를 누른다. 잔향 꼬리가 걸릴 자리로 잡는다.
+ *   비율(`ratio`)        — 2:1 이면 문턱 아래 6 dB 가 12 dB 로 벌어진다. 클수록 세다.
+ *   어택(`attackMs`)     — 소리가 올 때 손을 떼는 속도. 짧아야 타격이 안 뭉갠다.
+ *   릴리스(`releaseMs`)  — 소리가 멎은 뒤 누르기까지. **잔향을 얼마나 남길지가 여기다.**
+ *
+ * **스테레오는 두 채널을 묶는다.** 채널마다 따로 누르면 좌우가 다른 양으로
+ * 움직여 음상이 흔들린다 — 큰 쪽 채널로 재서 같은 이득을 건다. `timeStretch` 와 같은 이유다.
+ */
+export function applyExpander(
+  buffer: AudioBuffer,
+  opts: { thresholdDb?: number; ratio?: number; attackMs?: number; releaseMs?: number } = {}
+): AudioBuffer {
+  const thresholdDb = opts.thresholdDb ?? -30;
+  const ratio = Math.max(1, opts.ratio ?? 3);
+  const attackMs = Math.max(0.1, opts.attackMs ?? 2);
+  const releaseMs = Math.max(1, opts.releaseMs ?? 80);
+  if (ratio <= 1.0001) return buffer;
+
+  const sr = buffer.sampleRate;
+  const chans = buffer.numberOfChannels;
+  const data: Float32Array[] = [];
+  for (let c = 0; c < chans; c++) data.push(buffer.getChannelData(c));
+
+  /* 한 표본 지날 때 남는 비율. 시간이 길수록 1 에 가까워 천천히 움직인다. */
+  const coef = (ms: number) => Math.exp(-1 / ((ms / 1000) * sr));
+  const aEnv = coef(attackMs);
+  const rEnv = coef(releaseMs);
+  // 이득 자체도 살짝 미끄러뜨린다 — 계단으로 움직이면 지퍼 노이즈가 난다.
+  const gSmooth = coef(3);
+
+  let env = 0;
+  let gain = 1;
+  for (let i = 0; i < buffer.length; i++) {
+    // 채널을 묶어 잰다 — 큰 쪽이 기준이다.
+    let level = 0;
+    for (let c = 0; c < chans; c++) { const v = Math.abs(data[c][i]); if (v > level) level = v; }
+
+    // 올라갈 때는 어택, 내려갈 때는 릴리스.
+    env = level > env ? aEnv * (env - level) + level : rEnv * (env - level) + level;
+
+    const envDb = 20 * Math.log10(Math.max(env, 1e-9));
+    // 문턱 위는 손대지 않는다. 아래로 내려간 만큼을 (ratio-1) 배로 더 누른다.
+    const targetDb = envDb < thresholdDb ? (envDb - thresholdDb) * (ratio - 1) : 0;
+    const target = Math.pow(10, Math.max(targetDb, -80) / 20);
+    gain = gSmooth * (gain - target) + target;
+
+    for (let c = 0; c < chans; c++) data[c][i] *= gain;
+  }
+  return buffer;
+}
+
 export function applyNoiseGate(buffer: AudioBuffer, threshold = 0.005): AudioBuffer {
   const numChannels = buffer.numberOfChannels;
   for (let c = 0; c < numChannels; c++) {

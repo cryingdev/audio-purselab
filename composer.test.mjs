@@ -3,7 +3,7 @@ import {
   appendStartSec, wrapLoopEnds, clipEndSec, placeOnNewLanes,
   splitClipAt, rippleInsert, rippleDelete, moveTrack, removeTrack, placeClips
 } from './node_modules/.pulselab/composer.mjs';
-import { suggestAssetName, applyReverse, applyGainCapped, peakOfRange, applySpeedChange, timeStretch, barSeconds, TIME_STRETCH_FRAME_MS_DEFAULT, channelDifference, downmixToMono, MONO_IDENTICAL_THRESHOLD, applyNormalizeToDbfs, peakOf } from './node_modules/.pulselab/audioUtils.mjs';
+import { suggestAssetName, applyReverse, applyGainCapped, peakOfRange, applySpeedChange, timeStretch, barSeconds, TIME_STRETCH_FRAME_MS_DEFAULT, channelDifference, downmixToMono, MONO_IDENTICAL_THRESHOLD, applyNormalizeToDbfs, peakOf, applyExpander } from './node_modules/.pulselab/audioUtils.mjs';
 
 const SR = 48000;
 
@@ -657,6 +657,89 @@ console.log('\n[10] 담을 때 자동 손질 — 모노로 내리기 · 규격 �
     const silent = dc(0, 1);
     applyNormalizeToDbfs(silent, -3);
     check('무음은 안 건드린다 (0 으로 나누지 않는다)', peakOf(silent) === 0);
+  }
+}
+
+
+console.log('\n[11] 공간음 줄이기 — 다운워드 익스팬더');
+{
+  /** 타격 하나 + 뒤에 천천히 잦아드는 꼬리(잔향 흉내) */
+  const hitWithTail = (tailSec = 1, tau = 0.25) => {
+    const b = dc(0, 1.5 + tailSec);
+    const d = b.getChannelData(0);
+    for (let i = 0; i < 1200; i++) d[i] = Math.sin(2 * Math.PI * 300 * i / SR) * 0.9;   // 타격
+    const start = 1200;
+    for (let i = start; i < d.length; i++) {
+      const t = (i - start) / SR;
+      d[i] = Math.sin(2 * Math.PI * 300 * i / SR) * 0.25 * Math.exp(-t / tau);          // 꼬리
+    }
+    return b;
+  };
+  /** 어느 시각의 크기(dB) */
+  const at = (b, sec) => {
+    const d = b.getChannelData(0), i0 = Math.round(sec * SR);
+    let m = 0;
+    for (let i = i0; i < Math.min(d.length, i0 + 480); i++) m = Math.max(m, Math.abs(d[i]));
+    return 20 * Math.log10(Math.max(m, 1e-9));
+  };
+
+  {
+    const dry = hitWithTail();
+    /*
+     * 0.2초 지점은 아직 문턱 **위**다(-19 dB) — 거기서 안 눌리는 것이 맞다.
+     * 처음에 그걸 모르고 "0.2초에서 눌려야 한다"고 적었다가 실패했다.
+     * 문턱을 넘어 내려간 뒤(0.4초 -26 dB)부터 재야 한다.
+     */
+    const before = { hit: at(dry, 0.005), t200: at(dry, 0.2), t400: at(dry, 0.4), t800: at(dry, 0.8) };
+    applyExpander(dry, { thresholdDb: -20, ratio: 4, attackMs: 2, releaseMs: 60 });
+    const after = { hit: at(dry, 0.005), t200: at(dry, 0.2), t400: at(dry, 0.4), t800: at(dry, 0.8) };
+    check('타격은 거의 안 건드린다',
+      Math.abs(after.hit - before.hit) < 1.5, `${before.hit.toFixed(1)} → ${after.hit.toFixed(1)} dB`);
+    check('문턱 위(0.2초 · -19 dB)는 그대로 둔다',
+      Math.abs(after.t200 - before.t200) < 1, `${before.t200.toFixed(1)} → ${after.t200.toFixed(1)} dB`);
+    check('문턱 아래로 내려간 꼬리는 눌린다 (0.4초)',
+      after.t400 < before.t400 - 6, `${before.t400.toFixed(1)} → ${after.t400.toFixed(1)} dB`);
+    check('멀수록 더 눌린다 (0.8초)',
+      (before.t800 - after.t800) > (before.t400 - after.t400),
+      `0.4초 ${(before.t400-after.t400).toFixed(1)} dB · 0.8초 ${(before.t800-after.t800).toFixed(1)} dB`);
+  }
+  {
+    // 비율 1 은 아무것도 안 한다
+    const b = hitWithTail();
+    const ref = at(b, 0.4);
+    applyExpander(b, { thresholdDb: -20, ratio: 1 });
+    check('비율 1 은 손대지 않는다', Math.abs(at(b, 0.4) - ref) < 1e-6);
+  }
+  {
+    // 문턱 위만 있는 자료는 그대로
+    const loud = dc(0.9, 0.5);
+    applyExpander(loud, { thresholdDb: -40, ratio: 4 });
+    check('문턱 위는 안 건드린다', Math.abs(loud.getChannelData(0)[20000] - 0.9) < 0.02,
+      `${loud.getChannelData(0)[20000].toFixed(4)}`);
+  }
+  {
+    // 스테레오는 두 채널이 같은 이득을 받아야 음상이 안 흔들린다
+    const st = new FakeBuffer(2, Math.round(SR * 1.5), SR);
+    for (let i = 0; i < st.length; i++) {
+      const v = Math.sin(2 * Math.PI * 300 * i / SR) * (i < 1200 ? 0.9 : 0.2 * Math.exp(-(i - 1200) / SR / 0.25));
+      st.getChannelData(0)[i] = v;
+      st.getChannelData(1)[i] = v * 0.5;     // 오른쪽이 절반 — 비율이 유지돼야 한다
+    }
+    applyExpander(st, { thresholdDb: -20, ratio: 4, releaseMs: 60 });
+    let worst = 0;
+    for (let i = 2000; i < st.length; i++) {
+      const L = st.getChannelData(0)[i], R = st.getChannelData(1)[i];
+      if (Math.abs(L) > 1e-5) worst = Math.max(worst, Math.abs(Math.abs(R / L) - 0.5));
+    }
+    check('스테레오 좌우 비가 유지된다', worst < 1e-3, `최대 어긋남 ${worst.toExponential(1)}`);
+  }
+  {
+    // 릴리스가 길면 꼬리가 더 남는다
+    const shortR = hitWithTail(); applyExpander(shortR, { thresholdDb: -20, ratio: 4, releaseMs: 20 });
+    const longR = hitWithTail();  applyExpander(longR,  { thresholdDb: -20, ratio: 4, releaseMs: 400 });
+    // 문턱을 넘어 내려간 뒤에서 재야 릴리스 차이가 보인다.
+    check('릴리스가 길수록 꼬리가 남는다', at(longR, 0.4) > at(shortR, 0.4) + 2,
+      `짧게 ${at(shortR,0.4).toFixed(1)} dB · 길게 ${at(longR,0.4).toFixed(1)} dB`);
   }
 }
 

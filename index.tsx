@@ -18,6 +18,7 @@ import {
   Download,
   X,
   Wind,
+  Waves,
   Ruler,
   AlertTriangle,
   Info,
@@ -49,6 +50,7 @@ import {
   audioBufferToWav,
   applyFade,
   applyNoiseGate,
+  applyExpander,
   applyReverse,
   applyCut,
   applyCrop,
@@ -1508,6 +1510,34 @@ const App: React.FC = () => {
    * 음악·환경음은 스테레오여야 한다 — 무턱대고 내리면 규격을 어긴다. 좌우가 같은
    * 것을 내리는 것은 잃을 것이 없는 일(파형이 그대로다)이라 안전하다.
    */
+  /*
+   * 공간음 줄이기. 잔향은 타격 뒤에 남는 감쇠부라, 문턱 아래로 내려간 만큼을
+   * 비율만큼 더 누르면 꼬리가 짧아지고 방이 물러난다.
+   * 어택은 2 ms 로 못 박았다 — 타격을 살리려면 짧아야 하고, 손댈 값이 셋이면 충분하다.
+   */
+  /*
+   * 기본값은 실측으로 골랐다. 처음에 -22 / 3.5 / 70 을 넣었더니 봉우리와 골의 차가
+   * 5.3 → 6.0 dB, 거의 아무 일도 안 했다 — **누르고도 안 걸린 줄 아는 값**이다.
+   * water-pumping.wav(RT60 ≈ 0.7초)로 훑어 보니 문턱이 결정적이고 릴리스는 짧을수록
+   * 세다. -18 / 5 / 40 에서 5.3 → 16.6 dB 로 벌어지면서 RMS 는 0.3 dB 밖에 안 줄어
+   * 본 소리를 안 잃는다.
+   *
+   * 문턱을 dB 로 고정해 둘 수 있는 것은 **담을 때 -3 dBFS 로 맞추기 때문**이다.
+   * 크기가 제각각이면 같은 문턱이 자료마다 다른 자리를 가리킨다.
+   */
+  const [expThreshold, setExpThreshold] = useState(-18);
+  const [expRatio, setExpRatio] = useState(5);
+  const [expRelease, setExpRelease] = useState(40);
+
+  const handleExpanderAction = () => {
+    performProcessing(
+      `공간음 줄이는 중 (문턱 ${expThreshold} dB · ${expRatio}:1 · 릴리스 ${expRelease} ms)…`,
+      (buffer) => applyExpander(buffer, {
+        thresholdDb: expThreshold, ratio: expRatio, attackMs: 2, releaseMs: expRelease,
+      })
+    );
+  };
+
   const [autoMono, setAutoMono] = useState(true);
   const [autoNormalize, setAutoNormalize] = useState(true);
 
@@ -2387,6 +2417,50 @@ const App: React.FC = () => {
                     어택·릴리스가 없어 문턱 아래를 표본마다 0 으로 떨군다.
                     디지털 무음을 자르는 데만 쓰고, 게이트로 쓰면 지퍼 노이즈가 난다.
                   */}
+                  {/*
+                    공간음 줄이기. 게이트와 갈라 둔다 — 게이트는 문턱 아래를 0 으로
+                    떨궈서 꼬리가 뚝 끊기고, 이건 비율만큼 눌러 내려 잔향에 쓸 수 있다.
+                    실측(water-pumping.wav, RT60 ≈ 0.7초): 세게 걸면 봉우리와 골의 차가
+                    5.3 → 19.0 dB 로 벌어졌다.
+                  */}
+                  {stage === '다듬기' && group('공간음 줄이기', 'text-violet-400/70', <>
+                    <Knob
+                      label="문턱"
+                      value={expThreshold} min={-60} max={0} step={1} resetTo={-18}
+                      onChange={setExpThreshold}
+                      size={38}
+                      accent="#a78bfa"
+                      format={(v) => `${v} dB`}
+                      title="이 아래를 누른다. **세 값 중 이것이 결정적이다.** 실측(RT60 0.7초 자료): -22 는 거의 안 걸리고, -18 에서 봉우리-골이 5.3 → 16.6 dB 로 벌어진다. 너무 높이 잡으면 본 소리까지 눌린다."
+                    />
+                    <Knob
+                      label="비율"
+                      value={expRatio} min={1} max={10} step={0.5} resetTo={5}
+                      onChange={setExpRatio}
+                      size={38}
+                      accent="#a78bfa"
+                      format={(v) => `${v}:1`}
+                      title="문턱 아래를 얼마나 벌릴지. 2:1 이면 6 dB 아래가 12 dB 로 내려간다. 1:1 은 아무것도 안 한다."
+                    />
+                    <Knob
+                      label="릴리스"
+                      value={expRelease} min={5} max={500} step={5} resetTo={40}
+                      onChange={setExpRelease}
+                      size={38}
+                      accent="#a78bfa"
+                      format={(v) => `${v} ms`}
+                      title="소리가 멎은 뒤 누르기까지. 짧을수록 세다 — 같은 문턱에서 40 ms 는 80 ms 보다 두 배 넘게 벌린다. 여기가 방을 얼마나 남길지다."
+                    />
+                    <button
+                      onClick={handleExpanderAction}
+                      disabled={audio.isProcessing || expRatio <= 1}
+                      className="flex items-center gap-1.5 px-4 py-2 bg-violet-600/90 hover:bg-violet-500 disabled:opacity-30 text-white rounded-xl border border-violet-400/50 text-[10px] font-black uppercase tracking-widest transition-all"
+                      title="타격은 두고 꼬리만 눌러 방을 물린다. 어택은 2 ms 로 고정 — 타격을 살리려면 짧아야 한다."
+                    >
+                      <Waves className="w-3.5 h-3.5" /> 공간음 줄이기
+                    </button>
+                  </>)}
+
                   {stage === '다듬기' && group('잔 소리 다듬기', 'text-slate-500', <>
                     <Knob
                       label="문턱값"
