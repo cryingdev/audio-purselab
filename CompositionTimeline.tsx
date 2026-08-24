@@ -348,6 +348,36 @@ const CompositionTimeline: React.FC<Props> = ({
   if (clips.length === 0 && minLanes === 0) return null;
 
   const step = niceStep(spanSec, Math.max(contentWidth, 1));
+  /*
+   * 재생 헤드 끌기(스크럽).
+   *
+   * 전에는 눈금을 **한 번 누를 때만** 자리를 옮겼다 — 헤드를 잡아 끌 수가 없어서,
+   * 조금씩 옮기려면 누르고 결과를 보고 다시 누르기를 되풀이해야 했다.
+   * 누르는 순간 옮기고 뗄 때까지 따라오게 하면 손이 한 번만 움직인다.
+   *
+   * 헤드 자체에도 손잡이를 단다. 눈금 줄은 22 px 밖에 안 되는데다, 눈으로 좇는
+   * 것은 눈금이 아니라 **헤드**라 거기를 잡으려 드는 것이 자연스럽다.
+   */
+  const [scrubbing, setScrubbing] = useState(false);
+  const beginScrub = (e: React.PointerEvent) => {
+    if (e.button !== 0 || pxPerSec <= 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const box = contentRef.current?.getBoundingClientRect();
+    if (!box) return;
+    const at = (clientX: number) => Math.min(spanSec, Math.max(0, (clientX - box.left) / pxPerSec));
+    onSeek(at(e.clientX));
+    setScrubbing(true);
+    const move = (ev: PointerEvent) => onSeek(at(ev.clientX));
+    const up = () => {
+      setScrubbing(false);
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+
   const ticks: number[] = [];
   for (let t = 0; t <= spanSec; t += step) ticks.push(t);
 
@@ -530,16 +560,12 @@ const CompositionTimeline: React.FC<Props> = ({
           style={{ height: RULER_H + bodyH }}
         >
           <div ref={contentRef} className="relative" style={{ width: Math.max(contentWidth, 1), height: RULER_H + bodyH }}>
-            {/* 시간 눈금 — 누르면 그 자리로 재생 위치를 옮긴다 */}
+            {/* 시간 눈금 — 누른 자리로 옮기고, 뗄 때까지 따라온다 */}
             <div
-              className="absolute inset-x-0 top-0 border-b border-slate-800 cursor-text"
+              className="absolute inset-x-0 top-0 border-b border-slate-800 cursor-ew-resize"
               style={{ height: RULER_H }}
-              onPointerDown={(e) => {
-                if (e.button !== 0 || pxPerSec <= 0) return;
-                e.stopPropagation();
-                const box = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                onSeek(Math.max(0, (e.clientX - box.left) / pxPerSec));
-              }}
+              onPointerDown={beginScrub}
+              title="눌러서 재생 위치를 옮깁니다 — 잡고 끌면 따라옵니다"
             >
               {pxPerSec > 0 && ticks.map(t => (
                 <div key={t} className="absolute top-0 h-full" style={{ left: t * pxPerSec }}>
@@ -679,7 +705,21 @@ const CompositionTimeline: React.FC<Props> = ({
                 className="absolute top-0 w-px bg-amber-400 pointer-events-none z-30"
                 style={{ left: currentTime * pxPerSec, height: RULER_H + bodyH }}
               >
-                <div className="absolute -top-0.5 -left-[3px] w-[7px] h-[7px] bg-amber-400 rounded-sm" />
+                {/*
+                  손잡이. 그리는 네모는 7 px 이지만 **잡히는 자리는 16 px** 로 넓힌다 —
+                  7 px 짜리를 마우스로 맞추려면 조준을 해야 하고, 그건 끌기의 목적을 없앤다.
+                */}
+                <div
+                  className={`absolute -top-[3px] -left-2 w-4 h-4 flex items-start justify-center pointer-events-auto ${
+                    scrubbing ? 'cursor-grabbing' : 'cursor-grab'
+                  }`}
+                  onPointerDown={beginScrub}
+                  title="잡고 끌어서 재생 위치를 옮깁니다"
+                >
+                  <div className={`w-[7px] h-[7px] rounded-sm transition-colors ${
+                    scrubbing ? 'bg-amber-200 ring-2 ring-amber-400/40' : 'bg-amber-400'
+                  }`} />
+                </div>
               </div>
             )}
           </div>
