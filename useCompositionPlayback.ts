@@ -96,6 +96,38 @@ export function useCompositionPlayback(clips: CompClip[], volume = 1, wrapMs = 0
     }
   }, []);
 
+  /**
+   * 소스를 하나 만들어 그 자리부터 재생한다.
+   *
+   * **끝 처리(`onended`)를 여기 한 군데에 둔다.** 전에는 `play()` 에서만 달아 뒀는데,
+   * 재생 중에 트랙을 고치거나(`rebuild`) 자리를 옮기면(`seek`) 소스가 갈아끼워지면서
+   * **끝 처리가 딸려 가지 않았다.** 그래서 트랙을 한 번이라도 고치고 나면 끝에 닿아도
+   * 안 멈추고 시계가 트랙 밖으로 계속 올라갔다.
+   */
+  const startSource = useCallback((buffer: AudioBuffer, fromSec: number) => {
+    const c = ctx();
+    stopSource();
+    const src = c.createBufferSource();
+    src.buffer = buffer;
+    src.connect(gainRef.current!);
+    applyLoop(src);
+    const from = Math.min(Math.max(0, fromSec), buffer.duration);
+    src.start(0, from);
+    src.onended = () => {
+      // 끝까지 갔을 때만 멈춘 것으로 친다 — 갈아끼우기로 끝난 경우는 제외한다.
+      if (srcRef.current === src) {
+        srcRef.current = null;
+        setPlaying(false);
+        offsetRef.current = buffer.duration;
+        setCurrentTime(buffer.duration);
+      }
+    };
+    srcRef.current = src;
+    startedAtRef.current = c.currentTime;
+    offsetRef.current = from;
+    return from;
+  }, [stopSource]);
+
   /** 클립에서 믹스를 다시 굽는다. 재생 중이면 위치를 지키며 이어 붙인다. */
   const rebuild = useCallback(() => {
     const c = ctx();
@@ -112,19 +144,9 @@ export function useCompositionPlayback(clips: CompClip[], volume = 1, wrapMs = 0
     }
     // 재생 중이었다면 새 믹스로 갈아끼우되 듣던 자리를 유지한다.
     if (srcRef.current) {
-      const at = offsetRef.current + (c.currentTime - startedAtRef.current);
-      stopSource();
-      const src = c.createBufferSource();
-      src.buffer = next;
-      src.connect(gainRef.current!);
-      applyLoop(src);
-      const from = Math.min(Math.max(0, at), next.duration);
-      src.start(0, from);
-      srcRef.current = src;
-      startedAtRef.current = c.currentTime;
-      offsetRef.current = from;
+      startSource(next, offsetRef.current + (c.currentTime - startedAtRef.current));
     }
-  }, [clips, wrapMs, stopSource]);
+  }, [clips, wrapMs, stopSource, startSource]);
 
   // 클립이 바뀌면 다시 굽는다 — 끄는 중에는 잠깐 모아서 한 번만.
   useEffect(() => {
@@ -136,27 +158,10 @@ export function useCompositionPlayback(clips: CompClip[], volume = 1, wrapMs = 0
     const c = ctx();
     if (!mix) return;
     void c.resume();
-    stopSource();
-    const src = c.createBufferSource();
-    src.buffer = mix;
-    src.connect(gainRef.current!);
-    applyLoop(src);
-    const from = offsetRef.current >= mix.duration ? 0 : offsetRef.current;
-    src.start(0, from);
-    src.onended = () => {
-      // 끝까지 갔을 때만 멈춘 것으로 친다 (갈아끼우기로 끝난 경우는 제외).
-      if (srcRef.current === src) {
-        srcRef.current = null;
-        setPlaying(false);
-        offsetRef.current = mix.duration;
-        setCurrentTime(mix.duration);
-      }
-    };
-    srcRef.current = src;
-    startedAtRef.current = c.currentTime;
-    offsetRef.current = from;
+    // 끝에 서 있으면 처음부터 — 그 자리에서 눌러 봐야 들리는 것이 없다.
+    startSource(mix, offsetRef.current >= mix.duration ? 0 : offsetRef.current);
     setPlaying(true);
-  }, [mix, stopSource]);
+  }, [mix, startSource]);
 
   const pause = useCallback(() => {
     const c = ctx();
@@ -168,21 +173,11 @@ export function useCompositionPlayback(clips: CompClip[], volume = 1, wrapMs = 0
   }, [stopSource]);
 
   const seek = useCallback((sec: number) => {
-    const c = ctx();
     const at = Math.max(0, mix ? Math.min(sec, mix.duration) : sec);
     offsetRef.current = at;
     setCurrentTime(at);
-    if (srcRef.current && mix) {
-      stopSource();
-      const src = c.createBufferSource();
-      src.buffer = mix;
-      src.connect(gainRef.current!);
-      applyLoop(src);
-      src.start(0, at);
-      srcRef.current = src;
-      startedAtRef.current = c.currentTime;
-    }
-  }, [mix, stopSource]);
+    if (srcRef.current && mix) startSource(mix, at);
+  }, [mix, startSource]);
 
   const toggle = useCallback(() => { isPlaying ? pause() : play(); }, [isPlaying, pause, play]);
 
