@@ -98,6 +98,7 @@ import CompositionTimeline, { TrackSelection } from './CompositionTimeline';
 import { useCompositionPlayback } from './useCompositionPlayback';
 import { Knob } from './Knob';
 import { Switch } from './Switch';
+import { VSlider } from './VSlider';
 
 // --- Types ---
 
@@ -2444,15 +2445,20 @@ const App: React.FC = () => {
                     길이는 제자리에 음정만 옮겨간다.
                   */}
                   {stage === '다듬기' && group('음정 바꾸기', 'text-fuchsia-400/70', <>
-                    <Knob
+                    {/*
+                      음정만 세로 슬라이더다. **위아래가 뜻을 갖는 값**이라
+                      모양이 그대로 말해 준다 — 위가 높은 쪽, 가운데 금이 0.
+                      노브로는 "어느 쪽이 높은가"를 색과 각도로만 짐작해야 했다.
+                    */}
+                    <VSlider
                       label="반음"
                       value={pitchSemitones}
                       min={-PITCH_SEMITONES_MAX} max={PITCH_SEMITONES_MAX} step={1} resetTo={0}
                       onChange={setPitchSemitones}
-                      size={38}
+                      height={84}
                       accent="#e879f9"
                       format={(v) => (v === 0 ? '그대로' : `${v > 0 ? '+' : ''}${v} 반음`)}
-                      title={`길이는 그대로 두고 음정만 옮긴다. 한 옥타브가 12 반음이고 ±${PITCH_SEMITONES_MAX}(두 옥타브)까지 간다.\n말 상태음을 개체마다 달리 쓸 때는 ±2~3 반음이면 충분하다.`}
+                      title={`길이는 그대로 두고 음정만 옮긴다. 위가 높은 쪽이고 가운데 금이 0 이다.\n한 옥타브가 12 반음, ±${PITCH_SEMITONES_MAX}(두 옥타브)까지 간다.\n누른 자리로 바로 간다 — 곱게 맞추려면 Shift+끌기, 휠, 화살표 키. 두 번 누르면 0.\n말 상태음을 개체마다 달리 쓸 때는 ±2~3 반음이면 충분하다.`}
                     />
                     <button
                       onClick={handlePitchAction}
