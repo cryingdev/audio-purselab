@@ -1252,10 +1252,26 @@ const App: React.FC = () => {
     return true;
   };
 
+  /**
+   * 복사 = 담기만 한다. 규칙은 `잘라내기` 와 **같아야 한다** — 구간을 골랐으면 그
+   * 구간을, 없으면 고른 클립 통째를 담는다.
+   *
+   * 전에는 구간이 있을 때만 됐다. 그래서 클립만 고른 상태에서 `잘라내기` 는
+   * 눌리는데 `복사` 는 안 눌렸고, **Cmd+C 는 되는데 단추는 안 되는** 상태였다
+   * (단축키는 이미 `copyClip` 으로 클립 통째를 담고 있었다).
+   * 담고 빼느냐, 담기만 하느냐가 둘의 유일한 차이여야 한다.
+   */
   const handleCopyRange = () => {
-    if (!putRegionOnClipboard()) {
-      showNotice('먼저 트랙에서 구간을 그으십시오 — “구간 선택” 모드로 끌면 됩니다.');
+    if (clipRegion && editTargetClip) {
+      if (!putRegionOnClipboard()) showNotice('구간이 너무 짧습니다.');
+      return;
     }
+    if (selectedClipId) {
+      copyClip(selectedClipId);
+      showNotice('클립을 담았습니다 — “붙여넣기” 로 새 트랙에 겹칩니다.');
+      return;
+    }
+    showNotice('먼저 구간을 긋거나 클립을 고르십시오.');
   };
 
   /**
@@ -1316,9 +1332,11 @@ const App: React.FC = () => {
 
     const key = e.key.toLowerCase();
     if (key === 'c') {
-      // 구간을 그었으면 그 조각을, 아니면 고른 클립을 통째로 담는다.
-      if (clipRegion) { e.preventDefault(); handleCopyRange(); }
-      else if (selectedClipId) { e.preventDefault(); copyClip(selectedClipId); }
+      /*
+       * 단추와 **같은 함수**를 부른다. 전에는 여기서만 클립 통째를 담을 줄 알아서
+       * Cmd+C 는 되는데 단추는 안 되는 상태가 됐다 — 같은 일은 한 군데서 한다.
+       */
+      if (clipRegion || selectedClipId) { e.preventDefault(); handleCopyRange(); }
     } else if (key === 'x') {
       if (clipRegion || selectedClipId) { e.preventDefault(); handleCutRange(); }
     } else if (key === 'v') {
@@ -2745,9 +2763,9 @@ const App: React.FC = () => {
               </button>
               <button
                 onClick={handleCopyRange}
-                disabled={!clipRegion}
+                disabled={!clipRegion && !selectedClipId}
                 className="h-8 px-2 flex items-center gap-1 bg-violet-500/10 hover:bg-violet-500/20 disabled:opacity-30 text-violet-300 rounded-lg border border-violet-500/30 text-[10px] font-black uppercase tracking-widest transition-all"
-                title="고른 구간을 조각으로 뜬다 (⌘/Ctrl+C)"
+                title="구간을 골랐으면 그 구간을, 없으면 고른 클립 통째를 담는다 (⌘/Ctrl+C). “잘라내기”와 규칙이 같고, 빼지 않는 것만 다르다."
               >
                 <Copy className="w-3.5 h-3.5" /> 복사
               </button>
