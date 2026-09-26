@@ -348,6 +348,40 @@ export function applySpeedChange(buffer: AudioBuffer, ratio: number, audioCtx: A
   return out;
 }
 
+/** 한 번에 옮길 수 있는 음정. 두 옥타브 밖은 어떤 방식으로도 소리가 안 남는다. */
+export const PITCH_SEMITONES_MAX = 24;
+
+/**
+ * **길이는 그대로 두고 음정만** 옮긴다.
+ *
+ * 새 알고리즘이 아니라 이미 있는 둘을 겹친 것이다:
+ *   1. `timeStretch(p)` — 음정은 그대로 두고 길이를 p 배로 늘린다
+ *   2. `applySpeedChange(1/p)` — 길이를 도로 줄이는데, 이때 음정이 p 배로 올라간다
+ * 합치면 길이는 제자리, 음정만 p 배가 된다. `p = 2^(반음/12)` 다.
+ *
+ * 두 번째 배율을 `1/p` 가 아니라 **`원래 표본 수 ÷ 늘린 표본 수`** 로 잡는다.
+ * 두 번의 반올림이 겹치면 한두 표본이 어긋나는데, 이렇게 하면 길이가 **정확히** 같다.
+ *
+ * 품질 한계는 `timeStretch` 와 같다 — 조각 길이가 자료를 탄다. 환경음은 넓게
+ * 옮길 수 있고, 짧은 타격음은 ±몇 반음 안쪽이 무난하다.
+ */
+export function applyPitchShift(
+  buffer: AudioBuffer,
+  semitones: number,
+  audioCtx: AudioContext,
+  frameMs = TIME_STRETCH_FRAME_MS_DEFAULT
+): AudioBuffer {
+  const semi = Math.min(PITCH_SEMITONES_MAX, Math.max(-PITCH_SEMITONES_MAX, semitones));
+  if (Math.abs(semi) < 1e-6 || buffer.length === 0) {
+    const same = audioCtx.createBuffer(buffer.numberOfChannels, buffer.length, buffer.sampleRate);
+    for (let c = 0; c < buffer.numberOfChannels; c++) same.getChannelData(c).set(buffer.getChannelData(c));
+    return same;
+  }
+  const p = Math.pow(2, semi / 12);
+  const stretched = timeStretch(buffer, p, audioCtx, frameMs);
+  return applySpeedChange(stretched, buffer.length / stretched.length, audioCtx);
+}
+
 /**
  * 타임 스트레치의 조각 길이. 자료에 맞춰 고른다 — 짧으면 타격음이 안 번지고,
  * 길면 지속음이 매끄럽다. 화면과 함수가 같은 값을 봐야 하므로 여기 둔다.

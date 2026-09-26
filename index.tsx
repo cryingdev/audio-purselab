@@ -19,6 +19,7 @@ import {
   X,
   Wind,
   Waves,
+  Music,
   Ruler,
   AlertTriangle,
   Info,
@@ -64,6 +65,8 @@ import {
   TIME_STRETCH_FRAME_MS_DEFAULT,
   TIME_STRETCH_FRAME_MS_MIN,
   TIME_STRETCH_FRAME_MS_MAX,
+  applyPitchShift,
+  PITCH_SEMITONES_MAX,
   makeContext,
   decodeFileToBuffer,
   suggestAssetName,
@@ -1529,6 +1532,24 @@ const App: React.FC = () => {
   const [expRatio, setExpRatio] = useState(5);
   const [expRelease, setExpRelease] = useState(40);
 
+  /*
+   * 음정만 옮기기. 길이는 그대로 둔다 — 말 상태음을 개체마다 조금씩 달리 쓰려면
+   * 음정은 달라도 **길이는 같아야** 애니메이션과 안 어긋난다.
+   *
+   * 조각 길이는 `길이 바꾸기` 와 같은 값을 쓴다. 속을 보면 둘 다 `timeStretch`
+   * 라 품질을 가르는 손잡이가 하나뿐인데, 같은 값을 두 군데 두면 어느 쪽이
+   * 먹히는지 헷갈린다.
+   */
+  const [pitchSemitones, setPitchSemitones] = useState(0);
+
+  const handlePitchAction = () => {
+    if (pitchSemitones === 0) { showNotice('음정이 그대로입니다 — 반음을 올리거나 내리십시오.'); return; }
+    performProcessing(
+      `음정 ${pitchSemitones > 0 ? '+' : ''}${pitchSemitones} 반음…`,
+      (buffer, ctx) => applyPitchShift(buffer, pitchSemitones, ctx, stretchFrameMs)
+    );
+  };
+
   const handleExpanderAction = () => {
     performProcessing(
       `공간음 줄이는 중 (문턱 ${expThreshold} dB · ${expRatio}:1 · 릴리스 ${expRelease} ms)…`,
@@ -2417,6 +2438,37 @@ const App: React.FC = () => {
                     어택·릴리스가 없어 문턱 아래를 표본마다 0 으로 떨군다.
                     디지털 무음을 자르는 데만 쓰고, 게이트로 쓰면 지퍼 노이즈가 난다.
                   */}
+                  {/*
+                    음정 바꾸기. 새 알고리즘이 아니라 `timeStretch` 와
+                    `applySpeedChange` 를 겹친 것이다 — 늘렸다가 도로 줄이면
+                    길이는 제자리에 음정만 옮겨간다.
+                  */}
+                  {stage === '다듬기' && group('음정 바꾸기', 'text-fuchsia-400/70', <>
+                    <Knob
+                      label="반음"
+                      value={pitchSemitones}
+                      min={-PITCH_SEMITONES_MAX} max={PITCH_SEMITONES_MAX} step={1} resetTo={0}
+                      onChange={setPitchSemitones}
+                      size={38}
+                      accent="#e879f9"
+                      format={(v) => (v === 0 ? '그대로' : `${v > 0 ? '+' : ''}${v} 반음`)}
+                      title={`길이는 그대로 두고 음정만 옮긴다. 한 옥타브가 12 반음이고 ±${PITCH_SEMITONES_MAX}(두 옥타브)까지 간다.\n말 상태음을 개체마다 달리 쓸 때는 ±2~3 반음이면 충분하다.`}
+                    />
+                    <button
+                      onClick={handlePitchAction}
+                      disabled={audio.isProcessing || pitchSemitones === 0}
+                      className="flex items-center gap-1.5 px-4 py-2 bg-fuchsia-600/90 hover:bg-fuchsia-500 disabled:opacity-30 text-white rounded-xl border border-fuchsia-400/50 text-[10px] font-black uppercase tracking-widest transition-all"
+                      title={`조각 ${stretchFrameMs} ms 로 늘였다 도로 줄인다 — 품질 한계는 “길이 바꾸기”와 같다. 조각은 거기서 바꾼다(음정 유지를 켜면 나온다).`}
+                    >
+                      <Music className="w-3.5 h-3.5" /> 음정 바꾸기
+                    </button>
+                    {pitchSemitones !== 0 && (
+                      <span className="text-[10px] font-mono text-fuchsia-300 tabular-nums whitespace-nowrap self-center">
+                        ×{Math.pow(2, pitchSemitones / 12).toFixed(3)} · 길이 그대로 · 조각 {stretchFrameMs} ms
+                      </span>
+                    )}
+                  </>)}
+
                   {/*
                     공간음 줄이기. 게이트와 갈라 둔다 — 게이트는 문턱 아래를 0 으로
                     떨궈서 꼬리가 뚝 끊기고, 이건 비율만큼 눌러 내려 잔향에 쓸 수 있다.

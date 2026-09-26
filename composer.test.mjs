@@ -3,7 +3,7 @@ import {
   appendStartSec, wrapLoopEnds, clipEndSec, placeOnNewLanes,
   splitClipAt, rippleInsert, rippleDelete, moveTrack, removeTrack, placeClips
 } from './node_modules/.pulselab/composer.mjs';
-import { suggestAssetName, applyReverse, applyGainCapped, peakOfRange, applySpeedChange, timeStretch, barSeconds, TIME_STRETCH_FRAME_MS_DEFAULT, channelDifference, downmixToMono, MONO_IDENTICAL_THRESHOLD, applyNormalizeToDbfs, peakOf, applyExpander } from './node_modules/.pulselab/audioUtils.mjs';
+import { suggestAssetName, applyReverse, applyGainCapped, peakOfRange, applySpeedChange, timeStretch, barSeconds, TIME_STRETCH_FRAME_MS_DEFAULT, channelDifference, downmixToMono, MONO_IDENTICAL_THRESHOLD, applyNormalizeToDbfs, peakOf, applyExpander, applyPitchShift, PITCH_SEMITONES_MAX } from './node_modules/.pulselab/audioUtils.mjs';
 
 const SR = 48000;
 
@@ -740,6 +740,61 @@ console.log('\n[11] 공간음 줄이기 — 다운워드 익스팬더');
     // 문턱을 넘어 내려간 뒤에서 재야 릴리스 차이가 보인다.
     check('릴리스가 길수록 꼬리가 남는다', at(longR, 0.4) > at(shortR, 0.4) + 2,
       `짧게 ${at(shortR,0.4).toFixed(1)} dB · 길게 ${at(longR,0.4).toFixed(1)} dB`);
+  }
+}
+
+
+console.log('\n[12] 음정 바꾸기 — 길이는 그대로');
+{
+  const zeroCrossHz = (b) => {
+    const d = b.getChannelData(0);
+    let n = 0;
+    for (let i = 1; i < d.length; i++) if ((d[i - 1] < 0) !== (d[i] < 0)) n++;
+    return (n / 2) / (d.length / b.sampleRate);
+  };
+  const rms = (b) => {
+    const d = b.getChannelData(0);
+    let s2 = 0;
+    for (let i = 0; i < d.length; i++) s2 += d[i] * d[i];
+    return Math.sqrt(s2 / d.length);
+  };
+
+  const src = tone(440, 2);
+  for (const semi of [-12, -5, -2, 2, 5, 12]) {
+    const out = applyPitchShift(src, semi, ctx);
+    const want = 440 * Math.pow(2, semi / 12);
+    check(`${semi > 0 ? '+' : ''}${semi} 반음: 길이가 **정확히** 그대로`,
+      out.length === src.length, `${out.length} (원본 ${src.length})`);
+    check(`${semi > 0 ? '+' : ''}${semi} 반음: 음정이 맞는다`,
+      Math.abs(zeroCrossHz(out) - want) / want < 0.01,
+      `${zeroCrossHz(out).toFixed(1)} Hz (기대 ${want.toFixed(1)})`);
+  }
+  {
+    const out = applyPitchShift(src, 5, ctx);
+    const dropDb = 20 * Math.log10(rms(out) / rms(src));
+    check('음량이 안 파인다', Math.abs(dropDb) < 1.5, `${dropDb.toFixed(2)} dB`);
+  }
+  {
+    const same = applyPitchShift(src, 0, ctx);
+    let maxDiff = 0;
+    for (let i = 0; i < same.length; i++) maxDiff = Math.max(maxDiff, Math.abs(same.getChannelData(0)[i] - src.getChannelData(0)[i]));
+    check('0 반음은 손대지 않는다', same.length === src.length && maxDiff < 1e-9, `최대 차 ${maxDiff.toExponential(1)}`);
+  }
+  {
+    // 폭 밖은 묶인다 — 길이는 그래도 정확해야 한다
+    const out = applyPitchShift(src, 99, ctx);
+    check('폭 밖(99 반음)은 묶인다', out.length === src.length, `${out.length}`);
+    const want = 440 * Math.pow(2, PITCH_SEMITONES_MAX / 12);
+    check(`묶인 값이 +${PITCH_SEMITONES_MAX} 반음`, Math.abs(zeroCrossHz(out) - want) / want < 0.02,
+      `${zeroCrossHz(out).toFixed(0)} Hz (기대 ${want.toFixed(0)})`);
+  }
+  {
+    const st = tone(440, 1, 2);
+    const out = applyPitchShift(st, 3, ctx);
+    check('스테레오 채널 수 유지', out.numberOfChannels === 2 && out.length === st.length);
+    let worst = 0;
+    for (let i = 0; i < out.length; i++) worst = Math.max(worst, Math.abs(out.getChannelData(0)[i] - out.getChannelData(1)[i]));
+    check('좌우가 같은 자리에서 옮겨진다', worst < 1e-6, `최대 차 ${worst.toExponential(1)}`);
   }
 }
 
