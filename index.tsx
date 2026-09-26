@@ -2455,7 +2455,7 @@ const App: React.FC = () => {
                       value={pitchSemitones}
                       min={-PITCH_SEMITONES_MAX} max={PITCH_SEMITONES_MAX} step={1} resetTo={0}
                       onChange={setPitchSemitones}
-                      height={84}
+                      height={60}
                       accent="#e879f9"
                       format={(v) => (v === 0 ? '그대로' : `${v > 0 ? '+' : ''}${v} 반음`)}
                       title={`길이는 그대로 두고 음정만 옮긴다. 위가 높은 쪽이고 가운데 금이 0 이다.\n한 옥타브가 12 반음, ±${PITCH_SEMITONES_MAX}(두 옥타브)까지 간다.\n누른 자리로 바로 간다 — 곱게 맞추려면 Shift+끌기, 휠, 화살표 키. 두 번 누르면 0.\n말 상태음을 개체마다 달리 쓸 때는 ±2~3 반음이면 충분하다.`}
@@ -2468,11 +2468,16 @@ const App: React.FC = () => {
                     >
                       <Music className="w-3.5 h-3.5" /> 음정 바꾸기
                     </button>
-                    {pitchSemitones !== 0 && (
-                      <span className="text-[10px] font-mono text-fuchsia-300 tabular-nums whitespace-nowrap self-center">
-                        ×{Math.pow(2, pitchSemitones / 12).toFixed(3)} · 길이 그대로 · 조각 {stretchFrameMs} ms
-                      </span>
-                    )}
+                    {/*
+                      **늘 띄운다.** 0 일 때만 감췄더니 값이 0 을 지날 때마다 묶음이
+                      다시 접히면서 **슬라이더가 발밑에서 옮겨갔다** — 끌다가 손이
+                      엉뚱한 데를 짚는다. 자리를 비워 두는 편이 낫다.
+                    */}
+                    <span className={`text-[10px] font-mono tabular-nums whitespace-nowrap self-center ${
+                      pitchSemitones === 0 ? 'text-slate-600' : 'text-fuchsia-300'
+                    }`}>
+                      ×{Math.pow(2, pitchSemitones / 12).toFixed(3)} · 길이 그대로 · 조각 {stretchFrameMs} ms
+                    </span>
                   </>)}
 
                   {/*
